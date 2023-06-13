@@ -2,6 +2,7 @@ package v2
 
 import (
 	"net/http"
+	"strconv"
 
 	"github.com/actiontech/sqle/sqle/api/controller"
 	v1 "github.com/actiontech/sqle/sqle/api/controller/v1"
@@ -39,9 +40,10 @@ type AuditTaskSQLResV2 struct {
 }
 
 type AuditResult struct {
-	Level    string `json:"level" example:"warn"`
-	Message  string `json:"message" example:"避免使用不必要的内置函数md5()"`
-	RuleName string `json:"rule_name"`
+	Level     string `json:"level" example:"warn"`
+	Message   string `json:"message" example:"避免使用不必要的内置函数md5()"`
+	RuleName  string `json:"rule_name"`
+	Triggered bool   `json:"triggered"`
 }
 
 // @Summary 获取指定扫描任务的SQLs信息
@@ -77,6 +79,14 @@ func GetTaskSQLs(c echo.Context) error {
 		return controller.JSONBaseErrorReq(c, err)
 	}
 
+
+	instanceId := strconv.Itoa(int(task.InstanceId))
+	rules, err := s.GetRulesByInstanceId(instanceId)
+	if err != nil {
+		return controller.JSONBaseErrorReq(c, err)
+	}
+	
+
 	var offset uint32
 	if req.PageIndex >= 1 {
 		offset = req.PageSize * (req.PageIndex - 1)
@@ -98,6 +108,8 @@ func GetTaskSQLs(c echo.Context) error {
 
 	taskSQLsRes := make([]*AuditTaskSQLResV2, 0, len(taskSQLs))
 	for _, taskSQL := range taskSQLs {
+		existRules := make(map[string]bool)
+
 		taskSQLRes := &AuditTaskSQLResV2{
 			Number:      taskSQL.Number,
 			Description: taskSQL.Description,
@@ -114,7 +126,22 @@ func GetTaskSQLs(c echo.Context) error {
 				Level:    ar.Level,
 				Message:  ar.Message,
 				RuleName: ar.RuleName,
+				Triggered: true,
 			})
+			existRules[ar.Message] = true
+		}
+
+		for _, rule := range rules {
+			message := rule.Desc
+			_, err := existRules[message]
+			if !err {
+				taskSQLRes.AuditResult = append(taskSQLRes.AuditResult, &AuditResult{
+					Level:    rule.Level,
+					Message:  rule.Desc,
+					RuleName: rule.Name,
+					Triggered: false,
+				})
+			}
 		}
 
 		taskSQLsRes = append(taskSQLsRes, taskSQLRes)
