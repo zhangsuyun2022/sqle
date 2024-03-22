@@ -327,7 +327,7 @@ var Metas = []Meta{
 	},
 	{
 		Type:         TypeOracleTopSQL,
-		Desc:         "Oracle TOP SQL",
+		Desc:         "TOP SQL",
 		InstanceType: InstanceTypeOracle,
 		CreateTask:   NewOracleTopSQLTask,
 		Params: []*params.Param{
@@ -379,7 +379,7 @@ var Metas = []Meta{
 	},
 	{
 		Type:         TypeObForOracleTopSQL,
-		Desc:         "OceanBase For Oracle TOP SQL",
+		Desc:         "TOP SQL",
 		InstanceType: InstanceTypeObForOracle,
 		CreateTask:   NewObForOracleTopSQLTask,
 		Params: []*params.Param{
@@ -405,7 +405,7 @@ var Metas = []Meta{
 	},
 	{
 		Type:         TypeDmTopSQL,
-		Desc:         "DM TOP SQL",
+		Desc:         "TOP SQL",
 		InstanceType: InstanceTypeDm,
 		CreateTask:   NewDmTopSQLTask,
 		Params: []*params.Param{
