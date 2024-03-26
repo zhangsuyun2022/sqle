@@ -1559,3 +1559,95 @@ func NewBaiduRdsMySQLSlowLogTask(entry *logrus.Entry, ap *model.AuditPlan) Task 
 
 	return b
 }
+
+// DmSlowLogTask :DM慢日志
+type DmSlowLogTask struct {
+	*baseTask
+}
+
+func NewDmSlowLogTask(entry *logrus.Entry, ap *model.AuditPlan) Task {
+	return &DmSlowLogTask{newBaseTask(entry, ap)}
+}
+
+func (at *DmSlowLogTask) Audit() (*model.AuditPlanReportV2, error) {
+	task := &model.Task{
+		DBType: at.ap.DBType,
+	}
+	return at.baseTask.audit(task)
+}
+
+func (at *DmSlowLogTask) GetSQLs(args map[string]interface{}) ([]Head, []map[string]string, uint64, error) {
+	return dmSlowLogGetSQLs(args, at.persist)
+}
+
+// 获取达梦慢日志sql，用于前端页面展示
+func dmSlowLogGetSQLs(args map[string]interface{}, persist *model.Storage) ([]Head, []map[string]string, uint64, error) {
+	auditPlanSQLs, count, err := persist.GetAuditPlanSQLsByReq(args)
+	if err != nil {
+		return nil, nil, count, err
+	}
+
+	head := []Head{
+		{
+			Name: "fingerprint",
+			Desc: "SQL指纹",
+			Type: "sql",
+		},
+		{
+			Name: "sql",
+			Desc: "SQL",
+			Type: "sql",
+		},
+		{
+			Name: "counter",
+			Desc: "数量",
+		},
+		{
+			Name: "last_receive_timestamp",
+			Desc: "最后匹配时间",
+		},
+		{
+			Name: "query_time_avg",
+			Desc: "平均执行时间",
+		},
+		{
+			Name: "query_time_max",
+			Desc: "最长执行时间",
+		},
+		{
+			Name: "db_user",
+			Desc: "用户",
+		},
+		{
+			Name: "schema",
+			Desc: "Schema",
+		},
+	}
+	rows := make([]map[string]string, 0, len(auditPlanSQLs))
+	for _, sql := range auditPlanSQLs {
+		var info = struct {
+			Counter              uint64  `json:"counter"`
+			LastReceiveTimestamp string  `json:"last_receive_timestamp"`
+			QueryTimeAvg         float64 `json:"query_time_avg"`
+			QueryTimeMax         float64 `json:"query_time_max"`
+			DbUser               string  `json:"db_user"`
+			Schema               string  `json:"schema"`
+		}{}
+		err := json.Unmarshal(sql.Info, &info)
+		if err != nil {
+			return nil, nil, 0, err
+		}
+
+		rows = append(rows, map[string]string{
+			"sql":                    sql.SQLContent,
+			"fingerprint":            sql.Fingerprint,
+			"counter":                strconv.FormatUint(info.Counter, 10),
+			"last_receive_timestamp": info.LastReceiveTimestamp,
+			"query_time_avg":         strconv.FormatFloat(info.QueryTimeAvg, 'f', -1, 64),
+			"query_time_max":         strconv.FormatFloat(info.QueryTimeMax, 'f', -1, 64),
+			"db_user":                info.DbUser,
+			"schema":                 info.Schema,
+		})
+	}
+	return head, rows, count, nil
+}

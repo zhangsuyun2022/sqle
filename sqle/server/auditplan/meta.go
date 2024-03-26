@@ -31,6 +31,7 @@ const (
 	TypeAllAppExtract        = "all_app_extract"
 	TypeBaiduRdsMySQLSlowLog = "baidu_rds_mysql_slow_log"
 	TypeSQLFile              = "sql_file"
+	TypeMyDMSlowLog          = "dm_slow_log"
 )
 
 const (
@@ -38,6 +39,7 @@ const (
 	InstanceTypeMySQL  = "MySQL"
 	InstanceTypeOracle = "Oracle"
 	InstanceTypeTiDB   = "TiDB"
+	InstanceTypeDM     = "DM"
 )
 
 const (
@@ -323,6 +325,20 @@ var Metas = []Meta{
 		Desc:         "SQL文件",
 		InstanceType: InstanceTypeAll,
 		CreateTask:   NewDefaultTask,
+	},
+	{
+		Type:         TypeMyDMSlowLog,
+		Desc:         "慢日志",
+		InstanceType: InstanceTypeDM,
+		Params: []*params.Param{
+			{
+				Key:   paramKeyAuditSQLsScrappedInLastPeriodMinute,
+				Desc:  "审核过去时间段内抓取的SQL（分钟）",
+				Value: "0",
+				Type:  params.ParamTypeInt,
+			},
+		},
+		CreateTask: NewDmSlowLogTask,
 	},
 }
 
