@@ -9,6 +9,7 @@ import (
 	dmsV1 "github.com/actiontech/dms/pkg/dms-common/api/dms/v1"
 	"github.com/actiontech/dms/pkg/dms-common/dmsobject"
 	dmsCommonAes "github.com/actiontech/dms/pkg/dms-common/pkg/aes"
+	"github.com/actiontech/sqle/sqle/errors"
 	"github.com/actiontech/sqle/sqle/model"
 	"github.com/actiontech/sqle/sqle/pkg/params"
 )
@@ -34,6 +35,10 @@ func getInstances(ctx context.Context, req dmsV1.ListDBServiceReq) ([]*model.Ins
 		}
 
 		for _, item := range dbServices {
+			if item.SQLEConfig == nil || item.SQLEConfig.RuleTemplateID == "" {
+				continue
+			}
+
 			instance, err := convertInstance(item)
 			if err != nil {
 				return nil, fmt.Errorf("convert instance error: %v", err)
@@ -118,11 +123,6 @@ func convertInstance(instance *dmsV1.ListDBService) (*model.Instance, error) {
 		}
 	}
 
-	var ruleTemplates []model.RuleTemplate
-	if instance.SQLEConfig.RuleTemplateID != "" {
-		ruleTemplates = []model.RuleTemplate{{ProjectId: model.ProjectUID(instance.ProjectUID), Name: instance.SQLEConfig.RuleTemplateName}}
-	}
-
 	return &model.Instance{
 		ID:                uint64(instanceId),
 		Name:              instance.Name,
@@ -138,7 +138,6 @@ func convertInstance(instance *dmsV1.ListDBService) (*model.Instance, error) {
 		Desc:              instance.Desc,
 		AdditionalParams:  additionalParams,
 		SqlQueryConfig:    sqlQueryConfig,
-		RuleTemplates:     ruleTemplates,
 	}, nil
 }
 
@@ -192,6 +191,10 @@ func GetInstancesNameByRuleTemplateName(ctx context.Context, ruleTemplateName st
 }
 
 func GetInstanceInProjectByName(ctx context.Context, projectUid, name string) (*model.Instance, bool, error) {
+	if len(projectUid) == 0 || len(name) == 0 {
+		return nil, false, nil
+	}
+
 	return getInstance(ctx, dmsV1.ListDBServiceReq{
 		PageSize:     1,
 		FilterByName: name,
@@ -260,6 +263,10 @@ func GetInstanceNamesInProject(ctx context.Context, projectUid string) ([]string
 }
 
 func GetInstancesById(ctx context.Context, instanceId uint64) (*model.Instance, bool, error) {
+	if instanceId == 0 {
+		return nil, false, nil
+	}
+
 	return getInstance(ctx, dmsV1.ListDBServiceReq{
 		PageSize:    1,
 		FilterByUID: strconv.FormatUint(instanceId, 10),
@@ -267,10 +274,6 @@ func GetInstancesById(ctx context.Context, instanceId uint64) (*model.Instance, 
 }
 
 func GetInstancesByIds(ctx context.Context, instanceIds []uint64) ([]*model.Instance, error) {
-	if len(instanceIds) == 0 {
-		return nil, nil
-	}
-
 	ret := make([]*model.Instance, 0)
 	for _, instanceId := range instanceIds {
 		instance, exist, err := getInstance(ctx, dmsV1.ListDBServiceReq{
@@ -312,6 +315,10 @@ func GetInstanceIdNameMapByIds(ctx context.Context, instanceIds []uint64) (map[u
 }
 
 func GetInstanceInProjectById(ctx context.Context, projectUid string, instanceId uint64) (*model.Instance, bool, error) {
+	if len(projectUid) == 0 || instanceId == 0 {
+		return nil, false, nil
+	}
+
 	return getInstance(ctx, dmsV1.ListDBServiceReq{
 		PageSize:    1,
 		FilterByUID: strconv.FormatUint(instanceId, 10),
@@ -367,4 +374,96 @@ func GetInstanceCountGroupType(ctx context.Context) ([]InstanceTypeCount, error)
 	}
 
 	return ret, nil
+}
+
+func GetWorkflowDetailByWorkflowId(projectId, workflowId string, fn func(projectId, workflowId string) (*model.Workflow, bool, error)) (*model.Workflow, error) {
+	workflow, exist, err := fn(projectId, workflowId)
+	if err != nil {
+		return nil, err
+	}
+	if !exist {
+		return nil, errors.New(errors.DataNotExist, fmt.Errorf("workflow is not exist or you can't access it"))
+	}
+
+	instanceIds := make([]uint64, 0, len(workflow.Record.InstanceRecords))
+	for _, item := range workflow.Record.InstanceRecords {
+		instanceIds = append(instanceIds, item.InstanceId)
+	}
+
+	if len(instanceIds) == 0 {
+		return workflow, nil
+	}
+
+	instances, err := GetInstancesInProjectByIds(context.Background(), string(workflow.ProjectId), instanceIds)
+	if err != nil {
+		return nil, err
+	}
+	instanceMap := map[uint64]*model.Instance{}
+	for _, instance := range instances {
+		instanceMap[instance.ID] = instance
+	}
+	for i, item := range workflow.Record.InstanceRecords {
+		if instance, ok := instanceMap[item.InstanceId]; ok {
+			workflow.Record.InstanceRecords[i].Instance = instance
+		}
+	}
+
+	return workflow, nil
+}
+
+func GetAuditPlanWithInstanceFromProjectByName(projectId, name string, fn func(projectId, name string) (*model.AuditPlan, bool, error)) (*model.AuditPlan, bool, error) {
+	auditPlan, exist, err := fn(projectId, name)
+	if err != nil {
+		return nil, false, err
+	}
+	if !exist {
+		return nil, false, nil
+	}
+
+	instance, exists, err := GetInstanceInProjectByName(context.Background(), projectId, auditPlan.InstanceName)
+	if err != nil {
+		return nil, false, err
+	}
+	if exists {
+		auditPlan.Instance = instance
+	}
+	return auditPlan, true, nil
+}
+
+func GetActiveAuditPlansWithInstance(fn func() ([]*model.AuditPlan, error)) ([]*model.AuditPlan, error) {
+	auditPlans, err := fn()
+	if err != nil {
+		return nil, err
+	}
+
+	for i, item := range auditPlans {
+		// todo dms不支持跨项目查询实例，所以单个查询
+		instance, exists, err := GetInstanceInProjectByName(context.Background(), string(item.ProjectId), item.Name)
+		if err != nil {
+			continue
+		}
+		if exists {
+			auditPlans[i].Instance = instance
+		}
+	}
+	return auditPlans, nil
+}
+
+func GetAuditPlanWithInstanceById(id uint, fn func(id uint) (*model.AuditPlan, bool, error)) (*model.AuditPlan, bool, error) {
+	auditPlan, exist, err := fn(id)
+	if err != nil {
+		return nil, false, err
+	}
+	if !exist {
+		return nil, false, nil
+	}
+
+	instance, exists, err := GetInstanceInProjectByName(context.Background(), string(auditPlan.ProjectId), auditPlan.InstanceName)
+	if err != nil {
+		return nil, false, err
+	}
+	if exists {
+		auditPlan.Instance = instance
+	}
+	return auditPlan, true, nil
 }

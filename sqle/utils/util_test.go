@@ -196,3 +196,87 @@ func Test_IsClosed(t *testing.T) {
 		t.Error("c2 is closed")
 	}
 }
+
+func TestIncrementalAverageFloat64(t *testing.T) {
+	give := []float64{1, 2, 3, 3, 2, 1}
+	want := []float64{1, 1.5, 2, 2.25, 2.2, 2}
+	var average float64 = 0
+	var count int = 0
+	for index := range give {
+		average = IncrementalAverageFloat64(average, give[index], count, 1)
+		assert.Equal(t, average, want[index])
+		count++
+	}
+}
+
+func TestMaxFloat64(t *testing.T) {
+	var lessThan [2]float64 = [2]float64{1.111, 2.222}
+	var moreThan [2]float64 = [2]float64{2.222, 1.111}
+	var equal [2]float64 = [2]float64{2.222, 2.222}
+	assert.Equal(t, float64(2.222), MaxFloat64(lessThan[0], lessThan[1]))
+	assert.Equal(t, float64(2.222), MaxFloat64(moreThan[0], moreThan[1]))
+	assert.Equal(t, float64(2.222), MaxFloat64(equal[0], equal[1]))
+}
+
+func TestIsGitHttpURL(t *testing.T) {
+
+	trueCases := []string{
+		"https://github.com/golang/go.git",
+		"http://github.com/user/repo.git",
+	}
+
+	falseCases := []string{
+		"https://github.com/user/repo",
+		"ftp://github.com/user/repo.git",
+		"git@github.com:user/repo.git",
+	}
+
+	for _, tc := range trueCases {
+		assert.True(t, IsGitHttpURL(tc), "Expected %q to be a valid Git Http URL", tc)
+	}
+
+	for _, tc := range falseCases {
+		assert.False(t, IsGitHttpURL(tc), "Expected %q to be an invalid Git Http URL", tc)
+	}
+}
+
+func TestFullFuzzySearchRegexp(t *testing.T) {
+	testCases := []struct {
+		input       string
+		wantMatch   []string
+		wantNoMatch []string
+	}{
+		{
+			"Hello",
+			[]string{"heyHelloCode", "HElLO", "Sun_hello", "HelLo_Jack"},
+			[]string{"GoLang is awesome", "I love GOLANG", "GoLangGOLANGGolang"},
+		},
+		{
+			"Golang",
+			[]string{"GoLang is awesome", "I love GOLANG", "GoLangGOLANGGolang"},
+			[]string{"language", "hi", "heyHelloCode", "HElLO", "Sun_hello", "HelLo_Jack"},
+		}, {
+			".*(?i)",
+			[]string{"GoLang .*(?i) awesome", "I love GO^.*(?i)SING", "GoLangGO.*(?i)Golang"},
+			[]string{"language", "hi", "heyHelloCode", "HElLO", "Sun_hello", "HelLo_Jack"},
+		},
+	}
+
+	for _, tc := range testCases {
+		reg := FullFuzzySearchRegexp(tc.input)
+
+		// Positive cases
+		for _, s := range tc.wantMatch {
+			if !reg.MatchString(s) {
+				t.Errorf("Expected %q to match %v", s, reg)
+			}
+		}
+
+		// Negative cases
+		for _, s := range tc.wantNoMatch {
+			if reg.MatchString(s) {
+				t.Errorf("Expected %q NOT to match %v", s, reg)
+			}
+		}
+	}
+}

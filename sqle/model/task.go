@@ -31,6 +31,8 @@ const (
 	TaskSQLSourceFromFormData       = "form_data"
 	TaskSQLSourceFromSQLFile        = "sql_file"
 	TaskSQLSourceFromMyBatisXMLFile = "mybatis_xml_file"
+	TaskSQLSourceFromZipFile        = "zip_file"
+	TaskSQLSourceFromGitRepository  = "git_repository"
 	TaskSQLSourceFromAuditPlan      = "audit_plan"
 )
 
@@ -51,7 +53,7 @@ type Task struct {
 	ExecStartAt  *time.Time
 	ExecEndAt    *time.Time
 
-	Instance     *Instance      `json:"-" gorm:"foreignkey:InstanceId"`
+	Instance     *Instance
 	ExecuteSQLs  []*ExecuteSQL  `json:"-" gorm:"foreignkey:TaskId"`
 	RollbackSQLs []*RollbackSQL `json:"-" gorm:"foreignkey:TaskId"`
 }
@@ -112,6 +114,9 @@ type BaseSQL struct {
 	ExecStatus      string `json:"exec_status" gorm:"default:\"initialized\""`
 	ExecResult      string `json:"exec_result" gorm:"type:text"`
 	Schema          string `json:"schema"`
+	SourceFile      string `json:"source_file"`
+	StartLine       uint64 `json:"start_line" gorm:"not null"`
+	SQLType         string `json:"sql_type"` // such as DDL,DML,DQL...
 }
 
 func (s *BaseSQL) GetExecStatusDesc() string {
@@ -432,15 +437,18 @@ func (s *Storage) GetTaskByInstanceId(instanceId uint64) ([]Task, error) {
 }
 
 type TaskSQLDetail struct {
-	Number       uint           `json:"number"`
-	Description  string         `json:"description"`
-	ExecSQL      string         `json:"exec_sql"`
-	AuditResults AuditResults   `json:"audit_results"`
-	AuditLevel   string         `json:"audit_level"`
-	AuditStatus  string         `json:"audit_status"`
-	ExecResult   string         `json:"exec_result"`
-	ExecStatus   string         `json:"exec_status"`
-	RollbackSQL  sql.NullString `json:"rollback_sql"`
+	Number        uint           `json:"number"`
+	Description   string         `json:"description"`
+	ExecSQL       string         `json:"exec_sql"`
+	SQLSourceFile sql.NullString `json:"sql_source_file"`
+	SQLStartLine  uint64         `json:"sql_start_line"`
+	AuditResults  AuditResults   `json:"audit_results"`
+	AuditLevel    string         `json:"audit_level"`
+	AuditStatus   string         `json:"audit_status"`
+	ExecResult    string         `json:"exec_result"`
+	ExecStatus    string         `json:"exec_status"`
+	RollbackSQL   sql.NullString `json:"rollback_sql"`
+	SQLType       sql.NullString `json:"sql_type"`
 }
 
 func (t *TaskSQLDetail) GetAuditResults() string {
@@ -451,7 +459,7 @@ func (t *TaskSQLDetail) GetAuditResults() string {
 	return t.AuditResults.String()
 }
 
-var taskSQLsQueryTpl = `SELECT e_sql.number, e_sql.description, e_sql.content AS exec_sql, r_sql.content AS rollback_sql,
+var taskSQLsQueryTpl = `SELECT e_sql.number, e_sql.description, e_sql.content AS exec_sql,  e_sql.source_file AS sql_source_file, e_sql.start_line AS sql_start_line, e_sql.sql_type, r_sql.content AS rollback_sql,
 e_sql.audit_results, e_sql.audit_level, e_sql.audit_status, e_sql.exec_result, e_sql.exec_status
 
 {{- template "body" . -}}
@@ -529,8 +537,10 @@ func (s *Storage) GetExpiredTasks(start time.Time) ([]*Task, error) {
 	tasks := []*Task{}
 	err := s.db.Model(&Task{}).Select("tasks.id").
 		Joins("LEFT JOIN workflow_instance_records ON tasks.id = workflow_instance_records.task_id").
+		Joins("LEFT JOIN sql_audit_records ON tasks.id = sql_audit_records.task_id").
 		Where("tasks.created_at < ?", start).
 		Where("workflow_instance_records.id is NULL").
+		Where("sql_audit_records.id is NULL").
 		Scan(&tasks).Error
 
 	return tasks, errors.New(errors.ConnectStorageError, err)

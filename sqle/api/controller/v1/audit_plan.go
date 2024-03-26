@@ -1,9 +1,14 @@
 package v1
 
 import (
+	"bytes"
 	"context"
+	"encoding/csv"
 	"fmt"
+	"mime"
+	"net"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -22,6 +27,7 @@ import (
 	"github.com/actiontech/sqle/sqle/pkg/params"
 	"github.com/actiontech/sqle/sqle/server"
 	"github.com/actiontech/sqle/sqle/server/auditplan"
+	"github.com/actiontech/sqle/sqle/utils"
 	"github.com/labstack/echo/v4"
 	dry "github.com/ungerik/go-dry"
 )
@@ -221,7 +227,7 @@ func CreateAuditPlan(c echo.Context) error {
 	}
 
 	// check audit plan name
-	_, exist, err := s.GetAuditPlanFromProjectById(projectUid, req.Name)
+	_, exist, err := s.GetAuditPlanFromProjectByName(projectUid, req.Name)
 	if err != nil {
 		return controller.JSONBaseErrorReq(c, err)
 	}
@@ -256,7 +262,7 @@ func CreateAuditPlan(c echo.Context) error {
 		}
 		instanceType = inst.DbType
 		// check operation
-		user, err := controller.GetCurrentUser(c)
+		user, err := controller.GetCurrentUser(c, dms.GetUser)
 		if err != nil {
 			return controller.JSONBaseErrorReq(c, err)
 		}
@@ -297,8 +303,9 @@ func CreateAuditPlan(c echo.Context) error {
 
 	// generate token
 	userId := controller.GetUserID(c)
-
-	t, err := dmsCommonJwt.GenJwtToken(dmsCommonJwt.WithUserId(userId), dmsCommonJwt.WithExpiredTime(tokenExpire), dmsCommonJwt.WithAuditPlanName(req.Name))
+	// 为了控制JWT Token的长度，保证其长度不超过数据表定义的长度上限(255字符)
+	// 因此使用MD5算法将变长的 currentUserName 和 Name 转换为固定长度
+	t, err := dmsCommonJwt.GenJwtToken(dmsCommonJwt.WithUserId(userId), dmsCommonJwt.WithExpiredTime(tokenExpire), dmsCommonJwt.WithAuditPlanName(utils.Md5(req.Name)))
 	if err != nil {
 		return controller.JSONBaseErrorReq(c, errors.New(errors.DataConflict, err))
 	}
@@ -761,18 +768,112 @@ func GetAuditPlanReport(c echo.Context) error {
 	})
 }
 
+func filterSQLsByBlackList(sqls []*AuditPlanSQLReqV1, blackList []*model.BlackListAuditPlanSQL) []*AuditPlanSQLReqV1 {
+	if len(blackList) == 0 {
+		return sqls
+	}
+	filteredSQLs := []*AuditPlanSQLReqV1{}
+	filter := ConvertToBlackFilter(blackList)
+	for _, sql := range sqls {
+		if filter.HasEndpointInBlackList([]string{sql.Endpoint}) || filter.IsSqlInBlackList(sql.LastReceiveText) {
+			continue
+		}
+		filteredSQLs = append(filteredSQLs, sql)
+	}
+	return filteredSQLs
+}
+
+func ConvertToBlackFilter(blackList []*model.BlackListAuditPlanSQL) *BlackFilter {
+	var blackFilter BlackFilter
+	for _, filter := range blackList {
+		switch filter.FilterType {
+		case model.FilterTypeSQL:
+			blackFilter.BlackSqlList = append(blackFilter.BlackSqlList, utils.FullFuzzySearchRegexp(filter.FilterContent))
+		case model.FilterTypeHost:
+			blackFilter.BlackHostList = append(blackFilter.BlackHostList, utils.FullFuzzySearchRegexp(filter.FilterContent))
+		case model.FilterTypeIP:
+			ip := net.ParseIP(filter.FilterContent)
+			if ip == nil {
+				log.Logger().Errorf("wrong ip in black list,ip:%s", filter.FilterContent)
+				continue
+			}
+			blackFilter.BlackIpList = append(blackFilter.BlackIpList, ip)
+		case model.FilterTypeCIDR:
+			_, cidr, err := net.ParseCIDR(filter.FilterContent)
+			if err != nil {
+				log.Logger().Errorf("wrong cidr in black list,cidr:%s,err:%v", filter.FilterContent, err)
+				continue
+			}
+			blackFilter.BlackCidrList = append(blackFilter.BlackCidrList, cidr)
+		}
+	}
+	return &blackFilter
+}
+
+// 构造BlackFilter的目的是缓存黑名单中需要使用的结构体，在每个循环中复用
+type BlackFilter struct {
+	BlackSqlList  []*regexp.Regexp //更换正则匹配提高效率
+	BlackIpList   []net.IP
+	BlackHostList []*regexp.Regexp
+	BlackCidrList []*net.IPNet
+}
+
+func (f BlackFilter) IsSqlInBlackList(checkSql string) bool {
+	for _, blackSql := range f.BlackSqlList {
+		if blackSql.MatchString(checkSql) {
+			return true
+		}
+	}
+	return false
+}
+
+// 输入一组ip若其中有一个ip在黑名单中则返回true
+func (f BlackFilter) HasEndpointInBlackList(checkIps []string) bool {
+	var checkNetIp net.IP
+	for _, checkIp := range checkIps {
+		checkNetIp = net.ParseIP(checkIp)
+		if checkNetIp == nil {
+			// 无法解析IP，可能是域名，需要正则匹配
+			for _, blackHost := range f.BlackHostList {
+				if blackHost.MatchString(checkIp) {
+					return true
+				}
+			}
+		} else {
+			for _, blackIp := range f.BlackIpList {
+				if blackIp.Equal(checkNetIp) {
+					return true
+				}
+			}
+			for _, blackCidr := range f.BlackCidrList {
+				if blackCidr.Contains(checkNetIp) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 type FullSyncAuditPlanSQLsReqV1 struct {
 	SQLs []*AuditPlanSQLReqV1 `json:"audit_plan_sql_list" form:"audit_plan_sql_list" valid:"dive"`
 }
 
 type AuditPlanSQLReqV1 struct {
-	Fingerprint          string `json:"audit_plan_sql_fingerprint" form:"audit_plan_sql_fingerprint" example:"select * from t1 where id = ?"`
-	Counter              string `json:"audit_plan_sql_counter" form:"audit_plan_sql_counter" example:"6" valid:"required"`
-	LastReceiveText      string `json:"audit_plan_sql_last_receive_text" form:"audit_plan_sql_last_receive_text" example:"select * from t1 where id = 1"`
-	LastReceiveTimestamp string `json:"audit_plan_sql_last_receive_timestamp" form:"audit_plan_sql_last_receive_timestamp" example:"RFC3339"`
-	Schema               string `json:"audit_plan_sql_schema" from:"audit_plan_sql_schema" example:"db1"`
+	Fingerprint          string    `json:"audit_plan_sql_fingerprint" form:"audit_plan_sql_fingerprint" example:"select * from t1 where id = ?"`
+	Counter              string    `json:"audit_plan_sql_counter" form:"audit_plan_sql_counter" example:"6" valid:"required"`
+	LastReceiveText      string    `json:"audit_plan_sql_last_receive_text" form:"audit_plan_sql_last_receive_text" example:"select * from t1 where id = 1"`
+	LastReceiveTimestamp string    `json:"audit_plan_sql_last_receive_timestamp" form:"audit_plan_sql_last_receive_timestamp" example:"RFC3339"`
+	Schema               string    `json:"audit_plan_sql_schema" from:"audit_plan_sql_schema" example:"db1"`
+	QueryTimeAvg         *float64  `json:"query_time_avg" from:"query_time_avg" example:"3.22"`
+	QueryTimeMax         *float64  `json:"query_time_max" from:"query_time_max" example:"5.22"`
+	FirstQueryAt         time.Time `json:"first_query_at" from:"first_query_at" example:"2023-09-12T02:48:01.317880Z"`
+	DBUser               string    `json:"db_user" from:"db_user" example:"database_user001"`
+	Endpoint             string    `json:"endpoint" from:"endpoint" example:"10.186.1.2"`
 }
 
+// todo: 后续该接口会废弃
+// @Deprecated
 // @Summary 全量同步SQL到扫描任务
 // @Description full sync audit plan SQLs
 // @Id fullSyncAuditPlanSQLsV1
@@ -797,7 +898,7 @@ func FullSyncAuditPlanSQLs(c echo.Context) error {
 		return controller.JSONBaseErrorReq(c, err)
 	}
 
-	ap, exist, err := s.GetAuditPlanFromProjectById(projectUid, apName)
+	ap, exist, err := s.GetAuditPlanFromProjectByName(projectUid, apName)
 	if err != nil {
 		return controller.JSONBaseErrorReq(c, err)
 	}
@@ -805,18 +906,31 @@ func FullSyncAuditPlanSQLs(c echo.Context) error {
 		return controller.JSONBaseErrorReq(c, errAuditPlanNotExist)
 	}
 
-	sqls, err := convertToModelAuditPlanSQL(c, ap, req.SQLs)
+	l := log.NewEntry()
+	reqSQLs := req.SQLs
+	blackList, err := s.GetBlackListAuditPlanSQLs()
+	if err == nil {
+		reqSQLs = filterSQLsByBlackList(reqSQLs, blackList)
+	} else {
+		l.Warnf("blacklist is not used, err:%v", err)
+	}
+	if len(reqSQLs) == 0 {
+		return controller.JSONBaseErrorReq(c, nil)
+	}
+	sqls, err := convertToModelAuditPlanSQL(c, ap, reqSQLs)
 	if err != nil {
 		return controller.JSONBaseErrorReq(c, err)
 	}
 
-	return controller.JSONBaseErrorReq(c, auditplan.UploadSQLs(log.NewEntry(), ap, sqls, false))
+	return controller.JSONBaseErrorReq(c, auditplan.UploadSQLs(l, ap, sqls, false))
 }
 
 type PartialSyncAuditPlanSQLsReqV1 struct {
 	SQLs []*AuditPlanSQLReqV1 `json:"audit_plan_sql_list" form:"audit_plan_sql_list" valid:"dive"`
 }
 
+// todo: 后续该接口会废弃
+// @Deprecated
 // @Summary 增量同步SQL到扫描任务
 // @Description partial sync audit plan SQLs
 // @Id partialSyncAuditPlanSQLsV1
@@ -840,7 +954,7 @@ func PartialSyncAuditPlanSQLs(c echo.Context) error {
 		return controller.JSONBaseErrorReq(c, err)
 	}
 
-	ap, exist, err := s.GetAuditPlanFromProjectById(projectUid, apName)
+	ap, exist, err := dms.GetAuditPlanWithInstanceFromProjectByName(projectUid, apName, s.GetAuditPlanFromProjectByName)
 	if err != nil {
 		return controller.JSONBaseErrorReq(c, err)
 	}
@@ -848,11 +962,22 @@ func PartialSyncAuditPlanSQLs(c echo.Context) error {
 		return controller.JSONBaseErrorReq(c, errAuditPlanNotExist)
 	}
 
-	sqls, err := convertToModelAuditPlanSQL(c, ap, req.SQLs)
+	l := log.NewEntry()
+	reqSQLs := req.SQLs
+	blackList, err := s.GetBlackListAuditPlanSQLs()
+	if err == nil {
+		reqSQLs = filterSQLsByBlackList(reqSQLs, blackList)
+	} else {
+		l.Warnf("blacklist is not used, err:%v", err)
+	}
+	if len(reqSQLs) == 0 {
+		return controller.JSONBaseErrorReq(c, nil)
+	}
+	sqls, err := convertToModelAuditPlanSQL(c, ap, reqSQLs)
 	if err != nil {
 		return controller.JSONBaseErrorReq(c, err)
 	}
-	return controller.JSONBaseErrorReq(c, auditplan.UploadSQLs(log.NewEntry(), ap, sqls, true))
+	return controller.JSONBaseErrorReq(c, auditplan.UploadSQLs(l, ap, sqls, true))
 }
 
 func convertToModelAuditPlanSQL(c echo.Context, auditPlan *model.AuditPlan, reqSQLs []*AuditPlanSQLReqV1) ([]*auditplan.SQL, error) {
@@ -875,8 +1000,11 @@ func convertToModelAuditPlanSQL(c echo.Context, auditPlan *model.AuditPlan, reqS
 		}
 	}()
 
-	sqls := make([]*auditplan.SQL, len(reqSQLs))
-	for i, reqSQL := range reqSQLs {
+	sqls := make([]*auditplan.SQL, 0, len(reqSQLs))
+	for _, reqSQL := range reqSQLs {
+		if reqSQL.LastReceiveText == "" {
+			continue
+		}
 		fp := reqSQL.Fingerprint
 		// the caller may be written in a different language, such as (Java, Bash, Python), so the fingerprint is
 		// generated in different ways. In order to maintain th same fingerprint generation logic, we provide a way to
@@ -905,11 +1033,27 @@ func convertToModelAuditPlanSQL(c echo.Context, auditPlan *model.AuditPlan, reqS
 			"last_receive_timestamp": reqSQL.LastReceiveTimestamp,
 			server.AuditSchema:       reqSQL.Schema,
 		}
-		sqls[i] = &auditplan.SQL{
+		// 兼容老版本的Scannerd
+		// 老版本Scannerd不传输这两个字段，不记录到数据库中
+		// 并且这里避免记录0值到数据库中，导致后续计算出的平均时间出错
+		if reqSQL.QueryTimeAvg != nil {
+			info["query_time_avg"] = utils.Round(*reqSQL.QueryTimeAvg, 4)
+		}
+		if reqSQL.QueryTimeMax != nil {
+			info["query_time_max"] = utils.Round(*reqSQL.QueryTimeMax, 4)
+		}
+		if !reqSQL.FirstQueryAt.IsZero() {
+			info["first_query_at"] = reqSQL.FirstQueryAt
+		}
+		if reqSQL.DBUser != "" {
+			info["db_user"] = reqSQL.DBUser
+		}
+		sqls = append(sqls, &auditplan.SQL{
 			Fingerprint: fp,
 			SQLContent:  reqSQL.LastReceiveText,
 			Info:        info,
-		}
+			Schema:      reqSQL.Schema,
+		})
 	}
 	return sqls, nil
 }
@@ -947,6 +1091,8 @@ func TriggerAuditPlan(c echo.Context) error {
 	if err != nil {
 		return controller.JSONBaseErrorReq(c, err)
 	}
+	go notification.NotifyAuditPlanWebhook(ap, report)
+	
 	return c.JSON(http.StatusOK, &TriggerAuditPlanResV1{
 		BaseRes: controller.NewBaseReq(nil),
 		Data: AuditPlanReportResV1{
@@ -958,44 +1104,6 @@ func TriggerAuditPlan(c echo.Context) error {
 		},
 	})
 }
-
-// // deprecated. will be removed when sqle-ee is not referenced.
-// func CheckCurrentUserCanAccessAuditPlan(c echo.Context, apName string, opCode int) error {
-// 	storage := model.GetStorage()
-
-// 	ap, exist, err := storage.GetAuditPlanByName(apName)
-// 	if err != nil {
-// 		return err
-// 	}
-// 	if !exist {
-// 		return errAuditPlanNotExist
-// 	}
-
-// 	if controller.GetUserName(c) == model.DefaultAdminUser {
-// 		return nil
-// 	}
-
-// 	user, err := controller.GetCurrentUserFromDMS(c)
-// 	if err != nil {
-// 		return err
-// 	}
-
-// 	if ap.CreateUserID == user.ID {
-// 		return nil
-// 	}
-// 	if opCode > 0 {
-// 		instances, err := storage.GetUserCanOpInstances(user, []uint{uint(opCode)})
-// 		if err != nil {
-// 			return controller.JSONBaseErrorReq(c, errors.NewUserNotPermissionError(model.GetOperationCodeDesc(uint(opCode))))
-// 		}
-// 		for _, instance := range instances {
-// 			if ap.InstanceName == instance.Name {
-// 				return nil
-// 			}
-// 		}
-// 	}
-// 	return nil
-// }
 
 type UpdateAuditPlanNotifyConfigReqV1 struct {
 	NotifyInterval      *int    `json:"notify_interval" default:"10"`
@@ -1148,7 +1256,7 @@ func TestAuditPlanNotifyConfig(c echo.Context) error {
 	}
 
 	// s := model.GetStorage()
-	_, err = controller.GetCurrentUser(c)
+	_, err = controller.GetCurrentUser(c, dms.GetUser)
 	if err != nil {
 		// return controller.JSONBaseErrorReq(c, err)
 		// dms-todo: 需要判断用户是否存在，dms提供
@@ -1388,4 +1496,94 @@ func GetAuditPlanReportSQLsV1(c echo.Context) error {
 		Data:      auditPlanReportSQLsResV1,
 		TotalNums: count,
 	})
+}
+
+func spliceAuditResults(auditResults []model.AuditResult) string {
+	results := []string{}
+	for _, auditResult := range auditResults {
+		results = append(results, fmt.Sprintf("[%v]%v", auditResult.Level, auditResult.Message))
+	}
+	return strings.Join(results, "\n")
+}
+
+// GetAuditPlanAnalysisData get SQL explain and related table metadata for analysis
+// @Summary 以csv的形式导出扫描报告
+// @Description export audit plan report as csv
+// @Id exportAuditPlanReportV1
+// @Tags audit_plan
+// @Param project_name path string true "project name"
+// @Param audit_plan_name path string true "audit plan name"
+// @Param audit_plan_report_id path string true "audit plan report id"
+// @Security ApiKeyAuth
+// @Success 200 {file} file "get export audit plan report"
+// @router /v1/projects/{project_name}/audit_plans/{audit_plan_name}/reports/{audit_plan_report_id}/export [get]
+func ExportAuditPlanReportV1(c echo.Context) error {
+	s := model.GetStorage()
+	buff := new(bytes.Buffer)
+	reportIdStr := c.Param("audit_plan_report_id")
+	auditPlanName := c.Param("audit_plan_name")
+	projectName := c.Param("project_name")
+
+	reportId, err := strconv.Atoi(reportIdStr)
+	if err != nil {
+		return controller.JSONBaseErrorReq(c, err)
+	}
+	csvWriter := csv.NewWriter(buff)
+	buff.WriteString("\xEF\xBB\xBF") // 写入UTF-8 BOM
+	reportInfo, exist, err := s.GetReportWithAuditPlanByReportID(reportId)
+	if !exist {
+		return controller.JSONBaseErrorReq(c, fmt.Errorf("not found audit report"))
+	}
+	if err != nil {
+		return controller.JSONBaseErrorReq(c, err)
+	}
+	if reportInfo.AuditPlan == nil {
+		return controller.JSONBaseErrorReq(c, fmt.Errorf("the audit plan corresponding to the report was not found"))
+	}
+
+	baseInfo := [][]string{
+		{"扫描任务名称", auditPlanName},
+		{"报告生成时间", reportInfo.CreatedAt.Format("2006/01/02 15:04")},
+		{"审核结果评分", strconv.FormatInt(int64(reportInfo.Score), 10)},
+		{"审核通过率", fmt.Sprintf("%v%%", reportInfo.PassRate*100)},
+		{"所属项目", projectName},
+		{"扫描任务创建人", dms.GetUserNameWithDelTag(reportInfo.AuditPlan.CreateUserID)},
+		{"扫描任务类型", reportInfo.AuditPlan.Type},
+		{"数据库类型", reportInfo.AuditPlan.DBType},
+		{"审核的数据库", reportInfo.AuditPlan.InstanceDatabase},
+	}
+	err = csvWriter.WriteAll(baseInfo)
+	if err != nil {
+		return controller.JSONBaseErrorReq(c, err)
+	}
+
+	// Add a split line between report information and sql audit information
+	err = csvWriter.Write([]string{})
+	if err != nil {
+		return controller.JSONBaseErrorReq(c, err)
+	}
+
+	err = csvWriter.Write([]string{"编号", "SQL", "审核结果"})
+	if err != nil {
+		return controller.JSONBaseErrorReq(c, err)
+	}
+
+	sqlInfo := [][]string{}
+	for idx, sql := range reportInfo.AuditPlanReportSQLs {
+		sqlInfo = append(sqlInfo, []string{strconv.Itoa(idx + 1), sql.SQL, spliceAuditResults(sql.AuditResults)})
+	}
+
+	err = csvWriter.WriteAll(sqlInfo)
+	if err != nil {
+		return controller.JSONBaseErrorReq(c, err)
+	}
+
+	csvWriter.Flush()
+
+	fileName := fmt.Sprintf("扫描任务报告_%s_%s.csv", auditPlanName, time.Now().Format("20060102150405"))
+	c.Response().Header().Set(echo.HeaderContentDisposition, mime.FormatMediaType("attachment", map[string]string{
+		"filename": fileName,
+	}))
+
+	return c.Blob(http.StatusOK, "text/csv", buff.Bytes())
 }

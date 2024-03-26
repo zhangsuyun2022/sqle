@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/pingcap/parser/ast"
+	"github.com/pingcap/parser/opcode"
 	driver "github.com/pingcap/tidb/types/parser_driver"
 )
 
@@ -157,13 +158,18 @@ func (se *SubQueryMaxNestNumExtractor) Leave(in ast.Node) (node ast.Node, ok boo
 }
 
 type TableSourceExtractor struct {
-	TableSources map[string] /*origin table name without database name*/ *ast.TableSource
+	TableSources map[string] /*origin table name and as name without database name*/ *ast.TableSource
 }
 
 func (ts *TableSourceExtractor) Enter(in ast.Node) (node ast.Node, skipChildren bool) {
 	switch stmt := in.(type) {
 	case *ast.TableSource:
-		ts.TableSources[(stmt.Source).(*ast.TableName).Name.O] = stmt
+		if stmt.AsName.L != "" {
+			ts.TableSources[stmt.AsName.L] = stmt
+		}
+		if tableName, ok := stmt.Source.(*ast.TableName); ok {
+			ts.TableSources[tableName.Name.O] = stmt
+		}
 	}
 	return in, false
 }
@@ -225,5 +231,133 @@ func (v *SelectVisitor) Enter(in ast.Node) (out ast.Node, skipChildren bool) {
 }
 
 func (v *SelectVisitor) Leave(in ast.Node) (out ast.Node, ok bool) {
+	return in, true
+}
+
+type ColumnNameVisitor struct {
+	ColumnNameList []*ast.ColumnNameExpr
+}
+
+func (v *ColumnNameVisitor) Enter(in ast.Node) (out ast.Node, skipChildren bool) {
+	switch stmt := in.(type) {
+	case *ast.ColumnNameExpr:
+		v.ColumnNameList = append(v.ColumnNameList, stmt)
+	}
+	return in, false
+}
+
+func (v *ColumnNameVisitor) Leave(in ast.Node) (out ast.Node, ok bool) {
+	return in, true
+}
+
+type WhereVisitor struct {
+	WhereList         []ast.ExprNode
+	WhetherContainNil bool // 是否需要包含空的where，例如select * from t1 该语句的where为空
+}
+
+func (v *WhereVisitor) append(where ast.ExprNode) {
+	if where != nil {
+		v.WhereList = append(v.WhereList, where)
+	} else if v.WhetherContainNil {
+		v.WhereList = append(v.WhereList, nil)
+	}
+}
+
+func (v *WhereVisitor) Enter(in ast.Node) (out ast.Node, skipChildren bool) {
+	switch stmt := in.(type) {
+	case *ast.SelectStmt:
+		if stmt.From == nil { //If from is null skip check. EX: select 1;select version
+			return in, false
+		}
+		v.append(stmt.Where)
+	case *ast.UpdateStmt:
+		v.append(stmt.Where)
+	case *ast.DeleteStmt:
+		v.append(stmt.Where)
+	}
+	return in, false
+}
+
+func (v *WhereVisitor) Leave(in ast.Node) (out ast.Node, ok bool) {
+	return in, true
+}
+
+type EqualColumns struct {
+	Left  *ast.ColumnName
+	Right *ast.ColumnName
+}
+type EqualConditionVisitor struct {
+	ConditionList []EqualColumns
+}
+
+func (v *EqualConditionVisitor) Enter(in ast.Node) (out ast.Node, skipChildren bool) {
+	switch stmt := in.(type) {
+	case *ast.BinaryOperationExpr:
+		var tableNameL, tableNameR string
+		var equalColumns EqualColumns
+		if stmt.Op == opcode.EQ {
+			switch t := stmt.L.(type) {
+			case *ast.ColumnNameExpr:
+				tableNameL = t.Name.Table.L
+				equalColumns.Left = t.Name
+			}
+			switch t := stmt.R.(type) {
+			case *ast.ColumnNameExpr:
+				tableNameR = t.Name.Table.L
+				equalColumns.Right = t.Name
+			}
+			if tableNameL != "" && tableNameR != "" && tableNameL != tableNameR {
+				v.ConditionList = append(v.ConditionList, equalColumns)
+			}
+		}
+	}
+	return in, false
+}
+
+func (v *EqualConditionVisitor) Leave(in ast.Node) (out ast.Node, ok bool) {
+	return in, true
+}
+
+type FuncCallExprVisitor struct {
+	FuncCallList []*ast.FuncCallExpr
+}
+
+func (v *FuncCallExprVisitor) Enter(in ast.Node) (out ast.Node, skipChildren bool) {
+	switch stmt := in.(type) {
+	case *ast.FuncCallExpr:
+		v.FuncCallList = append(v.FuncCallList, stmt)
+	}
+	return in, false
+}
+
+func (v *FuncCallExprVisitor) Leave(in ast.Node) (out ast.Node, ok bool) {
+	return in, true
+}
+
+type WhereWithTable struct {
+	WhereStmt *ast.ExprNode
+	TableRef  *ast.Join
+}
+
+type WhereWithTableVisitor struct {
+	WhereStmts []*WhereWithTable
+}
+
+func (v *WhereWithTableVisitor) Enter(in ast.Node) (out ast.Node, skipChildren bool) {
+	switch stmt := in.(type) {
+	case *ast.SelectStmt:
+		if stmt.From == nil { //If from is null, skip check. EX: select 1;select version;
+			return in, false
+		}
+		v.WhereStmts = append(v.WhereStmts, &WhereWithTable{WhereStmt: &stmt.Where, TableRef: stmt.From.TableRefs})
+	case *ast.DeleteStmt:
+		v.WhereStmts = append(v.WhereStmts, &WhereWithTable{WhereStmt: &stmt.Where, TableRef: stmt.TableRefs.TableRefs})
+	case *ast.UpdateStmt:
+		v.WhereStmts = append(v.WhereStmts, &WhereWithTable{WhereStmt: &stmt.Where, TableRef: stmt.TableRefs.TableRefs})
+	}
+	return in, false
+}
+
+func (v *WhereWithTableVisitor) Leave(in ast.Node) (out ast.Node, ok bool) {
 	return in, true
 }

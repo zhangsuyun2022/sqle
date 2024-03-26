@@ -26,6 +26,8 @@ var storage *Storage
 
 var storageMutex sync.Mutex
 
+var pluginRules map[string][]*driverV2.Rule
+
 const dbDriver = "mysql"
 
 func InitStorage(s *Storage) {
@@ -91,7 +93,7 @@ func (m Model) GetIDStr() string {
 func NewStorage(user, password, host, port, schema string, debug bool) (*Storage, error) {
 	log.Logger().Infof("connecting to storage, host: %s, port: %s, user: %s, schema: %s",
 		host, port, user, schema)
-	db, err := gorm.Open("mysql", fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?charset=utf8&parseTime=True&loc=Local",
+	db, err := gorm.Open("mysql", fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?charset=utf8mb4&parseTime=True&loc=Local",
 		user, password, host, port, schema))
 	if err != nil {
 		log.Logger().Errorf("connect to storage failed, error: %v", err)
@@ -115,23 +117,14 @@ var autoMigrateList = []interface{}{
 	&AuditPlanSQLV2{},
 	&AuditPlan{},
 	&ExecuteSQL{},
-	// 禁止自动生成instance
-	// &Instance{},
-	// &WeChatConfiguration{},
-	// &LDAPConfiguration{},
-	// &Oauth2Configuration{},
 	&RoleOperation{},
-	// &Role{},
 	&RollbackSQL{},
 	&RuleTemplateRule{},
 	&RuleTemplate{},
 	&Rule{},
-	// &SMTPConfiguration{},
 	&SqlWhitelist{},
 	&SystemVariable{},
 	&Task{},
-	// &UserGroup{},
-	// &User{},
 	&WorkflowRecord{},
 	&WorkflowStepTemplate{},
 	&WorkflowStep{},
@@ -141,21 +134,20 @@ var autoMigrateList = []interface{}{
 	&SqlQueryHistory{},
 	&TaskGroup{},
 	&WorkflowInstanceRecord{},
-	// &CloudBeaverUserCache{},
-	// &CloudBeaverInstanceCache{},
-	// &Project{},
-	// &ProjectMemberRole{},
-	// &ProjectMemberGroupRole{},
-	// &ManagementPermission{},
+	&FeishuInstance{},
 	&IM{},
 	&DingTalkInstance{},
-	// &SyncInstanceTask{},
 	&OperationRecord{},
-	&PersonaliseConfig{},
-	&LogoConfig{},
-	// &WebHookConfig{},
 	&CustomRule{},
 	&RuleTemplateCustomRule{},
+	&SQLAuditRecord{},
+	&RuleKnowledge{},
+	&SqlManage{},
+	&SqlManageSqlAuditRecord{},
+	&BlackListAuditPlanSQL{},
+	&CompanyNotice{},
+	&SqlManageEndpoint{},
+	&SQLDevRecord{},
 }
 
 func (s *Storage) AutoMigrate() error {
@@ -165,6 +157,14 @@ func (s *Storage) AutoMigrate() error {
 	}
 	err = s.db.Model(AuditPlanSQLV2{}).AddUniqueIndex("uniq_audit_plan_sqls_v2_audit_plan_id_fingerprint_md5",
 		"audit_plan_id", "fingerprint_md5").Error
+	if err != nil {
+		return errors.New(errors.ConnectStorageError, err)
+	}
+	err = s.db.Model(BlackListAuditPlanSQL{}).AddUniqueIndex("uniq_type_content", "filter_type", "filter_content").Error
+	if err != nil {
+		return errors.New(errors.ConnectStorageError, err)
+	}
+	err = s.db.Model(&SqlManage{}).AddIndex("idx_project_id_status_deleted_at", "project_id", "status", "deleted_at").Error
 	if err != nil {
 		return errors.New(errors.ConnectStorageError, err)
 	}
@@ -179,12 +179,24 @@ func (s *Storage) AutoMigrate() error {
 }
 
 func (s *Storage) CreateRulesIfNotExist(rules map[string][]*driverV2.Rule) error {
+	isRuleExistInDB := func(rulesInDB []*Rule, targetRuleName, dbType string) (*Rule, bool) {
+		for i := range rulesInDB {
+			rule := rulesInDB[i]
+			if rule.DBType != dbType || rule.Name != targetRuleName {
+				continue
+			}
+			return rule, true
+		}
+		return nil, false
+	}
+
+	rulesInDB, err := s.GetAllRules()
+	if err != nil {
+		return err
+	}
 	for dbType, rules := range rules {
 		for _, rule := range rules {
-			existedRule, exist, err := s.GetRule(rule.Name, dbType)
-			if err != nil {
-				return err
-			}
+			existedRule, exist := isRuleExistInDB(rulesInDB, rule.Name, dbType)
 			// rule will be created or update if:
 			// 1. rule not exist;
 			if !exist {
@@ -208,15 +220,99 @@ func (s *Storage) CreateRulesIfNotExist(rules map[string][]*driverV2.Rule) error
 				isParamSame := reflect.DeepEqual(existRuleParam, pluginRuleParam)
 
 				if !isRuleDescSame || !isRuleAnnotationSame || !isRuleLevelSame || !isRuleTypSame || !isParamSame {
+					if existedRule.Knowledge != nil && existedRule.Knowledge.Content != "" {
+						// 知识库是可以在页面上编辑的，而插件里只是默认内容，以页面上编辑后的内容为准
+						rule.Knowledge.Content = existedRule.Knowledge.Content
+					}
+					// 保存规则
 					err := s.Save(GenerateRuleByDriverRule(rule, dbType))
 					if err != nil {
 						return err
+					}
+					if !isParamSame {
+						// 同步模板规则的参数
+						err = s.UpdateRuleTemplateRulesParams(rule, dbType)
+						if err != nil {
+							return err
+						}
 					}
 				}
 			}
 		}
 	}
 	return nil
+}
+
+func (s *Storage) UpdateRuleTemplateRulesParams(pluginRule *driverV2.Rule, dbType string) error {
+	ruleTemplateRules, err := s.GetRuleTemplateRuleByName(pluginRule.Name, dbType)
+	if err != nil {
+		return err
+	}
+	for _, ruleTemplateRule := range *ruleTemplateRules {
+		ruleTemplateRuleParamsMap := make(map[string]string)
+		for _, p := range ruleTemplateRule.RuleParams {
+			ruleTemplateRuleParamsMap[p.Key] = p.Value
+		}
+		for _, pluginParam := range pluginRule.Params {
+			// 避免参数的值被还原成默认
+			if value, ok := ruleTemplateRuleParamsMap[pluginParam.Key]; ok {
+				pluginParam.Value = value
+			}
+		}
+		ruleTemplateRule.RuleParams = pluginRule.Params
+		err = s.Save(&ruleTemplateRule)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// 为所有模板删除插件中已不存在的规则
+func (s *Storage) DeleteRulesIfNotExist(rules map[string][]*driverV2.Rule) error {
+	pluginRules = rules
+	// 避免清空规则
+	if len(pluginRules) <= 0 {
+		return nil
+	}
+	rulesInDB, err := s.GetAllRules()
+	if err != nil {
+		return err
+	}
+	for _, dbRule := range rulesInDB {
+		// 判断Plugin是不是读取到了，防止模板里规则被清空
+		if pluginExist := PluginIsExist(dbRule.DBType); !pluginExist {
+			continue
+		}
+		// 判断规则是否被删除
+		if ruleExist := DBRuleInPluginRule(dbRule); !ruleExist {
+			err := s.DeleteCascadeRule(dbRule.Name, dbRule.DBType)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func PluginIsExist(dbType string) bool {
+	for pluginDBType := range pluginRules {
+		if dbType == pluginDBType {
+			return true
+		}
+	}
+	return false
+}
+
+func DBRuleInPluginRule(dbRule *Rule) bool {
+	for dbType, rules := range pluginRules {
+		for _, rule := range rules {
+			if dbRule.Name == rule.Name && dbRule.DBType == dbType {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // func (s *Storage) CreateDefaultRole() error {

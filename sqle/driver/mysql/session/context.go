@@ -1,6 +1,7 @@
 package session
 
 import (
+	"database/sql"
 	"fmt"
 	"strconv"
 	"strings"
@@ -43,6 +44,8 @@ type TableInfo struct {
 
 	// save alter table parse object from input sql;
 	AlterTables []*ast.AlterTableStmt
+
+	Selectivity map[string] /*column name or index name*/ float64 /*selectivity*/
 }
 
 type SchemaInfo struct {
@@ -52,6 +55,7 @@ type SchemaInfo struct {
 	characterLoad    bool
 	DefaultCollation string
 	collationLoad    bool
+	IsRealSchema     bool // issue #1832, 判断当前的 schema 是否真实存在于数据库中.
 	Tables           map[string]*TableInfo
 }
 
@@ -167,7 +171,9 @@ func (c *Context) loadSchemas(schemas []string) {
 		if isLowerCaseTableName {
 			schema = strings.ToLower(schema)
 		}
-		c.schemas[schema] = &SchemaInfo{}
+		c.schemas[schema] = &SchemaInfo{
+			IsRealSchema: true,
+		}
 	}
 	c.setSchemasLoad()
 }
@@ -321,9 +327,19 @@ func (c *Context) UpdateContext(node ast.Node) {
 	switch s := node.(type) {
 	case *ast.UseStmt:
 		// change current schema
-		if c.hasSchema(s.DBName) {
-			c.SetCurrentSchema(s.DBName)
+		schemaInfo, ok := c.getSchema(s.DBName)
+		if !ok {
+			return
 		}
+		if schemaInfo.IsRealSchema {
+			// issue #1832
+			err := c.UseSchema(s.DBName)
+			if err != nil {
+				log.Logger().Warnf("update sql context failed, error: %v", err)
+			}
+		}
+		c.SetCurrentSchema(s.DBName)
+
 	case *ast.CreateDatabaseStmt:
 		if c.hasLoadSchemas() {
 			c.addSchema(s.Name)
@@ -546,7 +562,8 @@ func (c *Context) GetCreateTableStmt(stmt *ast.TableName) (*ast.CreateTableStmt,
 	if info.OriginalTableError != nil && IsParseShowCreateTableContentErr(info.OriginalTableError) { // todo #1630 临时减少解析失败时的调用次数
 		return nil, false, info.OriginalTableError
 	}
-	createTableSql, err := c.e.ShowCreateTable(utils.SupplementalQuotationMarks(stmt.Schema.String()), utils.SupplementalQuotationMarks(stmt.Name.String()))
+
+	createTableSql, err := c.e.ShowCreateTable(utils.SupplementalQuotationMarks(c.GetSchemaName(stmt)), utils.SupplementalQuotationMarks(stmt.Name.String()))
 	if err != nil {
 		return nil, exist, err
 	}
@@ -567,27 +584,31 @@ func (c *Context) GetCreateTableStmt(stmt *ast.TableName) (*ast.CreateTableStmt,
 /*
 建表语句可能如下:
 CREATE TABLE `__all_server_event_history` (
-  `gmt_create` timestamp(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-  `svr_ip` varchar(46) NOT NULL,
-  `svr_port` bigint(20) NOT NULL,
-  `module` varchar(64) NOT NULL,
-  `event` varchar(64) NOT NULL,
-  `name1` varchar(256) DEFAULT '',
-  `value1` varchar(256) DEFAULT '',
-  `name2` varchar(256) DEFAULT '',
-  `value2` longtext DEFAULT NULL,
-  `name3` varchar(256) DEFAULT '',
-  `value3` varchar(256) DEFAULT '',
-  `name4` varchar(256) DEFAULT '',
-  `value4` varchar(256) DEFAULT '',
-  `name5` varchar(256) DEFAULT '',
-  `value5` varchar(256) DEFAULT '',
-  `name6` varchar(256) DEFAULT '',
-  `value6` varchar(256) DEFAULT '',
-  `extra_info` varchar(512) DEFAULT '',
-  PRIMARY KEY (`gmt_create`, `svr_ip`, `svr_port`)
+
+	`gmt_create` timestamp(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+	`svr_ip` varchar(46) NOT NULL,
+	`svr_port` bigint(20) NOT NULL,
+	`module` varchar(64) NOT NULL,
+	`event` varchar(64) NOT NULL,
+	`name1` varchar(256) DEFAULT '',
+	`value1` varchar(256) DEFAULT '',
+	`name2` varchar(256) DEFAULT '',
+	`value2` longtext DEFAULT NULL,
+	`name3` varchar(256) DEFAULT '',
+	`value3` varchar(256) DEFAULT '',
+	`name4` varchar(256) DEFAULT '',
+	`value4` varchar(256) DEFAULT '',
+	`name5` varchar(256) DEFAULT '',
+	`value5` varchar(256) DEFAULT '',
+	`name6` varchar(256) DEFAULT '',
+	`value6` varchar(256) DEFAULT '',
+	`extra_info` varchar(512) DEFAULT '',
+	PRIMARY KEY (`gmt_create`, `svr_ip`, `svr_port`)
+
 ) DEFAULT CHARSET = utf8mb4 ROW_FORMAT = COMPACT COMPRESSION = 'none' REPLICA_NUM = 1 BLOCK_SIZE = 16384 USE_BLOOM_FILTER = FALSE TABLET_SIZE = 134217728 PCTFREE = 10 TABLEGROUP = 'oceanbase'
- partition by key_v2(svr_ip, svr_port)
+
+	partition by key_v2(svr_ip, svr_port)
+
 (partition p0,
 partition p1,
 partition p2,
@@ -606,7 +627,6 @@ partition p14,
 partition p15)
 
 建表语句后半段是options，oceanbase mysql模式下的show create table结果返回的options中包含mysql不支持的options, 为了能解析, 方法将会倒着遍历建表语句, 每次找到右括号时截断后面的部分, 然后尝试解析一次, 直到解析成功, 此时剩余的建表语句将不在包含OB特有options
-
 */
 func (c *Context) parseCreateTableSqlCompatibly(createTableSql string) (*ast.CreateTableStmt, error) {
 	for i := len(createTableSql) - 1; i >= 0; i-- {
@@ -647,54 +667,234 @@ func (c *Context) GetCollationDatabase(stmt *ast.TableName, schemaName string) (
 	return collation, nil
 }
 
-// GetMaxIndexOptionForTable get max index option column of table.
-func (c *Context) GetMaxIndexOptionForTable(stmt *ast.TableName, columnNames []string) (float64, error) {
-	ti, exist := c.GetTableInfo(stmt)
-	if !exist || !ti.isLoad {
-		return -1, nil
+type index struct {
+	SchemaName string
+	TableName  string
+	IndexName  string
+}
+
+/*
+示例：
+
+	mysql> [透传语句]SELECT (s.CARDINALITY / t.TABLE_ROWS) * 100 AS INDEX_SELECTIVITY, s.INDEX_NAME FROM INFORMATION_SCHEMA.STATISTICS s JOIN INFORMATION_SCHEMA.TABLES t ON s.TABLE_SCHEMA = t.TABLE_SCHEMA AND s.TABLE_NAME = t.TABLE_NAME WHERE (s.TABLE_SCHEMA , s.TABLE_NAME , s.INDEX_NAME) IN (("db_name","table_name","idx_name_1"),("db_name","table_name","idx_name_2"));
+
+									  ↓包含透传语句时会多出info列
+	+-------------------+------------+--------------------+
+	| INDEX_SELECTIVITY | INDEX_NAME | info               |
+	+-------------------+------------+--------------------+
+	|          100.0000 | idx_name_2 | set_1700620716_1   |
+	|           28.5714 | idx_name_1 | set_1700620716_1   |
+	|           28.5714 | idx_name_1 | set_1700620716_1   |
+	+-------------------+------------+--------------------+
+*/
+func (c *Context) getSelectivityByIndex(indexes []index) (map[string] /*index name*/ float64, error) {
+	if len(indexes) == 0 {
+		return make(map[string]float64, 0), nil
+	}
+	if c.e == nil {
+		return nil, nil
+	}
+	values := make([]string, 0, len(indexes))
+	for _, index := range indexes {
+		values = append(
+			values,
+			fmt.Sprintf("('%s', '%s', '%s')", index.SchemaName, index.TableName, index.IndexName),
+		)
+	}
+	results, err := c.e.Db.Query(
+		fmt.Sprintf(
+			`SELECT (s.CARDINALITY / t.TABLE_ROWS) * 100 AS INDEX_SELECTIVITY,s.INDEX_NAME FROM INFORMATION_SCHEMA.STATISTICS s JOIN INFORMATION_SCHEMA.TABLES t ON s.TABLE_SCHEMA = t.TABLE_SCHEMA AND s.TABLE_NAME = t.TABLE_NAME WHERE (s.TABLE_SCHEMA , s.TABLE_NAME , s.INDEX_NAME) IN (%s);`,
+			strings.Join(values, ","),
+		),
+	)
+	if err != nil {
+		return nil, err
 	}
 
-	for _, columnName := range columnNames {
-		if !util.TableExistCol(ti.OriginalTable, columnName) {
-			return -1, nil
+	var selectivityValue float64
+	var indexSelectivityMap = make(map[string]float64, len(indexes))
+	var indexSelectivity, indexName sql.NullString
+	for _, resultMap := range results {
+		indexSelectivity = resultMap["INDEX_SELECTIVITY"]
+		indexName = resultMap["INDEX_NAME"]
+		if indexSelectivity.String == "" {
+			// 跳过选择性为空的列
+			continue
+		}
+		selectivityValue, err = strconv.ParseFloat(indexSelectivity.String, 64)
+		if err != nil {
+			return nil, err
+		}
+		indexSelectivityMap[indexName.String] = selectivityValue
+	}
+	return indexSelectivityMap, nil
+}
+
+func (c *Context) getSelectivity(schema, table, name string) (float64, bool) {
+	tableInfo, exist := c.getTable(schema, table)
+	if !exist {
+		return -1, false
+	}
+	if tableInfo.Selectivity == nil {
+		// selectivity not cached
+		return -1, false
+	}
+	if selectivity, ok := tableInfo.Selectivity[name]; ok {
+		return selectivity, true
+	}
+	return -1, false
+}
+
+func (c *Context) addSelectivity(schema, table, name string, selectivity float64) {
+	tableInfo, exist := c.getTable(schema, table)
+	if !exist {
+		return
+	}
+	if tableInfo.Selectivity == nil {
+		tableInfo.Selectivity = make(map[string]float64)
+	}
+	tableInfo.Selectivity[name] = selectivity
+}
+
+func (c *Context) GetSelectivityOfIndex(stmt *ast.TableName, indexNames []string) (map[string]float64, error) {
+	if len(indexNames) == 0 || stmt == nil {
+		return nil, nil
+	}
+	if exist, _ := c.IsTableExist(stmt); !exist {
+		// would not get selectivity if table not exist
+		return nil, fmt.Errorf("table not exist")
+	}
+	schemaName := c.GetSchemaName(stmt)
+	tableName := stmt.Name.L
+	cachedIndexSelectivity := make(map[string]float64)
+	indexes := make([]index, 0, len(indexNames))
+	for _, indexName := range indexNames {
+		if selectivity, ok := c.getSelectivity(schemaName, tableName, indexName); ok {
+			cachedIndexSelectivity[indexName] = selectivity
+		} else {
+			indexes = append(indexes, index{
+				SchemaName: schemaName,
+				TableName:  tableName,
+				IndexName:  indexName,
+			})
 		}
 	}
-
-	if c.e == nil {
-		return -1, nil
-	}
-
-	sqls := make([]string, 0, len(columnNames))
-	for _, col := range columnNames {
-		sqls = append(sqls, fmt.Sprintf("COUNT( DISTINCT ( %v ) ) / COUNT( * ) * 100 AS %v", col, col))
-	}
-
-	result, err := c.e.Db.Query(fmt.Sprintf("SELECT %v FROM %v", strings.Join(sqls, ","), stmt.Name))
+	indexSelectivity, err := c.getSelectivityByIndex(indexes)
 	if err != nil {
-		return -1, fmt.Errorf("query max index option for table error: %v", err)
+		return nil, fmt.Errorf("get selectivity by index error: %v", err)
 	}
-	maxIndexOption := -1.0
-	for _, r := range result {
-		for _, value := range r {
-			// 当表里没数据时上面的SQL查出来的结果为Null
-			if value.String == "" {
-				value.String = "0"
-			}
-			v, err := strconv.ParseFloat(value.String, 64)
-			if err != nil {
-				return -1, err
-			}
-			if maxIndexOption == -1 {
-				maxIndexOption = v
+
+	for indexName, selectivity := range indexSelectivity {
+		c.addSelectivity(schemaName, tableName, indexName, selectivity)
+	}
+	for indexName, selectivity := range cachedIndexSelectivity {
+		indexSelectivity[indexName] = selectivity
+	}
+	return indexSelectivity, nil
+}
+
+type column struct {
+	SchemaName string
+	TableName  string
+	ColumnName string
+}
+
+/*
+示例：
+
+	mysql> [TDSQL透传语句]SELECT COUNT( DISTINCT ( name ) ) / COUNT( * ) * 100 AS name,COUNT( DISTINCT ( age  ) ) / COUNT( * ) * 100 AS age FROM (SELECT name,age FROM test.test_table LIMIT 50000) t;
+						 ↓包含透传语句时会多出info列
+	+---------+---------+--------------------+
+	| name    | age     | info               |
+	+---------+---------+--------------------+
+	| 50.0000 | 75.0000 | set_1700620716_1   |
+	+---------+---------+--------------------+
+*/
+func (c *Context) getSelectivityByColumn(columns []column) (map[string] /*index name*/ float64, error) {
+	if len(columns) == 0 {
+		return make(map[string]float64, 0), nil
+	}
+	if c.e == nil {
+		return nil, nil
+	}
+	var selectivityValue float64
+	var columnSelectivityMap = make(map[string]float64, len(columns))
+
+	sqls := make([]string, 0, len(columns))
+	selectColumns := make([]string, 0, len(columns))
+	for _, column := range columns {
+		sqls = append(
+			sqls,
+			fmt.Sprintf("COUNT( DISTINCT ( `%v` ) ) / COUNT( * ) * 100 AS '%v'", column.ColumnName, column.ColumnName),
+		)
+		selectColumns = append(selectColumns, "`"+column.ColumnName+"`")
+		columnSelectivityMap[column.ColumnName] = 0
+	}
+
+	results, err := c.e.Db.Query(
+		fmt.Sprintf(
+			"SELECT %v FROM (SELECT %v FROM `%v`.`%v` LIMIT 50000) t;",
+			strings.Join(sqls, ","),
+			strings.Join(selectColumns, ","),
+			columns[0].SchemaName, columns[0].TableName,
+		),
+	)
+	if err != nil {
+		return nil, err
+	}
+	for _, resultMap := range results {
+		for k, v := range resultMap {
+			if _, ok := columnSelectivityMap[k]; !ok {
 				continue
 			}
-
-			if v > maxIndexOption {
-				maxIndexOption = v
+			if v.String == "" {
+				selectivityValue = -1
+			} else {
+				selectivityValue, err = strconv.ParseFloat(v.String, 64)
+				if err != nil {
+					return nil, err
+				}
 			}
+			columnSelectivityMap[k] = selectivityValue
 		}
 	}
-	return maxIndexOption, nil
+	return columnSelectivityMap, nil
+}
+
+func (c *Context) GetSelectivityOfColumns(stmt *ast.TableName, indexColumns []string) (map[string] /*column name*/ float64, error) {
+	if stmt == nil || len(indexColumns) == 0 {
+		return nil, nil
+	}
+	if exist, _ := c.IsTableExist(stmt); !exist {
+		// would not get selectivity if table not exist
+		return nil, fmt.Errorf("table not exist")
+	}
+	schemaName := c.GetSchemaName(stmt)
+	tableName := stmt.Name.L
+	cachedIndexSelectivity := make(map[string]float64)
+	columns := make([]column, 0, len(indexColumns))
+	for _, columnName := range indexColumns {
+		if selectivity, ok := c.getSelectivity(schemaName, tableName, columnName); ok {
+			cachedIndexSelectivity[columnName] = selectivity
+		} else {
+			columns = append(columns, column{
+				SchemaName: schemaName,
+				TableName:  tableName,
+				ColumnName: columnName,
+			})
+		}
+	}
+	columnSelectivity, err := c.getSelectivityByColumn(columns)
+	if err != nil {
+		return nil, fmt.Errorf("get selectivity by column error: %v", err)
+	}
+	for indexName, selectivity := range columnSelectivity {
+		c.addSelectivity(schemaName, tableName, indexName, selectivity)
+	}
+	for indexName, selectivity := range cachedIndexSelectivity {
+		columnSelectivity[indexName] = selectivity
+	}
+	return columnSelectivity, nil
 }
 
 // GetSchemaCharacter get schema default character.
@@ -722,6 +922,25 @@ func (c *Context) GetSchemaCharacter(stmt *ast.TableName, schemaName string) (st
 		schema.characterLoad = true
 	}
 	return character, nil
+}
+
+/*
+Example:
+
+	mysql> SELECT CHARACTER_SET_NAME FROM INFORMATION_SCHEMA.COLLATIONS WHERE COLLATION_NAME = "armscii8_bin";
+	+--------------------+
+	| CHARACTER_SET_NAME |
+	+--------------------+
+	| armscii8           |
+	+--------------------+
+	1 row in set (0.01 sec)
+*/
+func (c *Context) GetSchemaCharacterByCollation(collation string) (string, error) {
+	if collation == "" || c.e == nil {
+		return "", nil
+	}
+	return c.e.ShowDefaultConfiguration(
+		fmt.Sprintf("SELECT CHARACTER_SET_NAME FROM INFORMATION_SCHEMA.COLLATIONS WHERE COLLATION_NAME = \"%s\"", collation), "CHARACTER_SET_NAME")
 }
 
 // GetSchemaEngine get schema default engine.
@@ -777,7 +996,8 @@ func (c *Context) GetTableSize(stmt *ast.TableName) (float64, error) {
 
 // GetExecutionPlan get execution plan of SQL.
 func (c *Context) GetExecutionPlan(sql string) ([]*executor.ExplainRecord, error) {
-	if ep, ok := c.executionPlan[sql]; ok {
+	key := fmt.Sprintf("%s.%s", c.currentSchema, sql)
+	if ep, ok := c.executionPlan[key]; ok {
 		return ep, nil
 	}
 
@@ -790,7 +1010,7 @@ func (c *Context) GetExecutionPlan(sql string) ([]*executor.ExplainRecord, error
 		return nil, err
 	}
 
-	c.executionPlan[sql] = records
+	c.executionPlan[key] = records
 	return records, nil
 }
 
@@ -808,9 +1028,9 @@ func (c *Context) GetTableRowCount(tn *ast.TableName) (int, error) {
 		if c.e == nil {
 			return 0, nil
 		}
-		query := fmt.Sprintf("show table status from %s where name = '%s'", c.GetSchemaName(tn), tn.Name.String())
+		query := fmt.Sprintf("show table status from `%s` where name = '%s'", c.GetSchemaName(tn), tn.Name.String())
 		if c.IsLowerCaseTableName() {
-			query = fmt.Sprintf("show table status from %s where lower(name) = '%s'", c.GetSchemaName(tn), tn.Name.L)
+			query = fmt.Sprintf("show table status from `%s` where lower(name) = '%s'", c.GetSchemaName(tn), tn.Name.L)
 		}
 
 		records, err := c.e.Db.Query(query)
@@ -886,6 +1106,40 @@ func (c *Context) GetColumnCardinality(tn *ast.TableName, columnName string) (in
 	return *ti.columns[columnName].cardinality, nil
 }
 
+func (c *Context) UseSchema(schemaName string) error {
+	_, err := c.e.Db.Exec(fmt.Sprintf("use %s", schemaName))
+	if err != nil {
+		return errors.Wrap(err, "exec use schema")
+	}
+	return nil
+}
+
 func (c *Context) GetExecutor() *executor.Executor {
 	return c.e
+}
+
+func (c *Context) GetTableIndexesInfo(schema, tableName string) ([]*executor.TableIndexesInfo, error) {
+	return c.e.GetTableIndexesInfo(utils.SupplementalQuotationMarks(schema), utils.SupplementalQuotationMarks(tableName))
+}
+
+func (c *Context) GetTableNameCreateTableStmtMap(joinStmt *ast.Join) map[string] /*table name or alias table name*/ *ast.CreateTableStmt {
+	tableNameCreateTableStmtMap := make(map[string]*ast.CreateTableStmt)
+	tableSources := util.GetTableSources(joinStmt)
+	for _, tableSource := range tableSources {
+		if tableNameStmt, ok := tableSource.Source.(*ast.TableName); ok {
+			tableName := tableNameStmt.Name.L
+			if tableSource.AsName.L != "" {
+				// 如果使用别名，则需要用别名引用
+				tableName = tableSource.AsName.L
+			}
+
+			createTableStmt, exist, err := c.GetCreateTableStmt(tableNameStmt)
+			if err != nil || !exist {
+				continue
+			}
+			// TODO: 跨库的 JOIN 无法区分
+			tableNameCreateTableStmtMap[tableName] = createTableStmt
+		}
+	}
+	return tableNameCreateTableStmtMap
 }

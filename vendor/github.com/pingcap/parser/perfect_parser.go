@@ -2,6 +2,7 @@ package parser
 
 import (
 	"bytes"
+
 	"github.com/pingcap/parser/ast"
 )
 
@@ -9,18 +10,20 @@ import (
 // who contains unparsed SQL, the unparsed SQL will be parses to ast.UnparsedStmt.
 func (parser *Parser) PerfectParse(sql, charset, collation string) (stmt []ast.StmtNode, warns []error, err error) {
 	_, warns, err = parser.Parse(sql, charset, collation)
+	stmts := parser.result
+	parser.updateStartLineWithOffset(stmts)
 	if err == nil {
-		return parser.result, warns, nil
+		return stmts, warns, nil
 	}
 	// if err is not nil, the query string must be contains unparsed sql.
 
-	if len(parser.result) > 0 {
-		for _, stmt := range parser.result {
+	if len(stmts) > 0 {
+		for _, stmt := range stmts {
 			ast.SetFlag(stmt)
 		}
-		stmt = append(stmt, parser.result...)
+		stmt = append(stmt, stmts...)
 	}
-
+	parser.startLineOffset = parser.lexer.r.pos().Line - 1
 	// The origin SQL text(input args `sql`) consists of many SQL segments,
 	// each SQL segments is a complete SQL and be parsed into `ast.StmtNode`.
 	//
@@ -70,6 +73,12 @@ ScanLoop:
 				endOffset = l.lastScanOffset
 				break ScanLoop
 			}
+		case invalid:
+			// `Lex`内`scan`在进行token遍历时，当有特殊字符时返回invalid，此时未调用`inc`进行滑动，导致每次遍历同一个pos点位触发死循环。有多种情况会返回invalid。
+			// 对于解析器本身没影响，因为 token 提取失败就退出了，但是我们需要继续遍历。
+			if l.lastScanOffset == l.r.p.Offset {
+				l.r.inc()
+			}
 		}
 	}
 	unparsedStmtBuf := bytes.Buffer{}
@@ -79,6 +88,7 @@ ScanLoop:
 	unparsedSql := unparsedStmtBuf.String()
 	if len(unparsedSql) > 0 {
 		un := &ast.UnparsedStmt{}
+		un.SetStartLine(parser.startLineOffset + 1)
 		un.SetText(unparsedSql)
 		stmt = append(stmt, un)
 	}
@@ -94,4 +104,10 @@ ScanLoop:
 		}
 	}
 	return stmt, warns, nil
+}
+
+func (parser *Parser) updateStartLineWithOffset(stmts []ast.StmtNode) {
+	for i := range stmts {
+		stmts[i].SetStartLine(stmts[i].StartLine() + parser.startLineOffset)
+	}
 }

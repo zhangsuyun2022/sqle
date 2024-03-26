@@ -64,9 +64,9 @@ func DirectAuditByInstance(l *logrus.Entry, sql, schemaName string, instance *mo
 	return task, audit(l, task, plugin, customRules)
 }
 
-func AuditSQLByDBType(l *logrus.Entry, sql string, dbType string) (*model.Task, error) {
+func AuditSQLByDBType(l *logrus.Entry, sql string, dbType string, projectId string, ruleTemplateName string) (*model.Task, error) {
 	st := model.GetStorage()
-	rules, customRules, err := st.GetAllRulesByTmpNameAndProjectIdInstanceDBType("", "", nil, dbType)
+	rules, customRules, err := st.GetAllRulesByTmpNameAndProjectIdInstanceDBType(ruleTemplateName, projectId, nil, dbType)
 	if err != nil {
 		return nil, err
 	}
@@ -153,7 +153,7 @@ func hookAudit(l *logrus.Entry, task *model.Task, p driver.Plugin, hook AuditHoo
 		// 2. from audit plan
 		//		- the audit plan may collect SQLs which plugins can not Parse.
 		//      - In these case, we pass the raw SQL to plugins, it's ok.
-		node, err := parse(l, p, executeSQL.Content)
+		node, err := parse(l, p, strings.TrimSpace(executeSQL.Content))
 		if err != nil {
 			return err
 		}

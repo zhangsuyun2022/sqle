@@ -1,19 +1,28 @@
 package utils
 
 import (
+	"bytes"
 	"crypto/md5"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"io"
 	"math"
+	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 	"unicode"
+	"unicode/utf8"
 	"unsafe"
 
+	"github.com/actiontech/sqle/sqle/log"
 	"github.com/bwmarrin/snowflake"
+	"golang.org/x/text/encoding/simplifiedchinese"
+	"golang.org/x/text/transform"
 )
 
 // base64 encoding string to decode string
@@ -68,6 +77,20 @@ func RemoveDuplicate(c []string) []string {
 	for _, v := range c {
 		beforeLen := len(tmpMap)
 		tmpMap[v] = struct{}{}
+		AfterLen := len(tmpMap)
+		if beforeLen != AfterLen {
+			result = append(result, v)
+		}
+	}
+	return result
+}
+
+func RemoveDuplicatePtrUint64(c []*uint64) []*uint64 {
+	var tmpMap = map[uint64]struct{}{}
+	var result = []*uint64{}
+	for _, v := range c {
+		beforeLen := len(tmpMap)
+		tmpMap[*v] = struct{}{}
 		AfterLen := len(tmpMap)
 		if beforeLen != AfterLen {
 			result = append(result, v)
@@ -250,4 +273,74 @@ func TryClose(ch chan struct{}) {
 	if !IsClosed(ch) {
 		close(ch)
 	}
+}
+
+// 对比两个float64中更大的并返回
+func MaxFloat64(a, b float64) float64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// 计算float64变量的增量平均值
+func IncrementalAverageFloat64(oldAverage, newValue float64, oldCount, newCount int) float64 {
+	return (oldAverage*float64(oldCount) + newValue) / (float64(oldCount) + float64(newCount))
+}
+
+// 判断字符串是否是Git Http URL
+func IsGitHttpURL(s string) bool {
+	u, err := url.Parse(s)
+	if err != nil {
+		return false
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return false
+	}
+	if !strings.HasSuffix(u.Path, ".git") {
+		return false
+	}
+	return true
+}
+
+func IsPrefixSubStrArray(arr []string, prefix []string) bool {
+	if len(prefix) > len(arr) {
+		return false
+	}
+
+	for i := 0; i < len(prefix); i++ {
+		if arr[i] != prefix[i] {
+			return false
+		}
+	}
+
+	return true
+}
+
+// 全模糊匹配字符串，并且对大小写不敏感
+func FullFuzzySearchRegexp(str string) *regexp.Regexp {
+	return regexp.MustCompile(`^.*(?i)` + regexp.QuoteMeta(str) + `.*$`)
+}
+
+var ErrUnknownEncoding = errors.New("unknown encoding")
+
+var encodings = []transform.Transformer{
+	simplifiedchinese.GBK.NewDecoder(),
+}
+
+func ConvertToUtf8(in []byte) ([]byte, error) {
+	if utf8.Valid(in) {
+		return in, nil
+	}
+
+	for _, enc := range encodings {
+		reader := transform.NewReader(bytes.NewReader(in), enc)
+		out, err := io.ReadAll(reader)
+		if err == nil {
+			return out, nil
+		}
+		log.NewEntry().Errorf("ConvertToUtf8 failed: %v", err)
+	}
+
+	return nil, ErrUnknownEncoding
 }

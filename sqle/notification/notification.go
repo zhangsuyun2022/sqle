@@ -255,8 +255,7 @@ func (w *WorkflowNotification) notifyUser() []string {
 
 func notifyWorkflowWebhook(workflow *model.Workflow, wt WorkflowNotifyType) {
 	// dms-todo 使用projectid代替name
-	err := workflowSendRequest(getWorkflowNotifyTypeAction(wt), string(workflow.ProjectId), workflow.
-		WorkflowId, workflow.Subject, workflow.Record.Status)
+	err := workflowSendRequest(getWorkflowNotifyTypeAction(wt), workflow)
 	if err != nil {
 		log.NewEntry().Errorf("workflow webhook failed: %v", err)
 	}
@@ -280,36 +279,12 @@ func notifyWorkflow(sqleUrl string, workflow *model.Workflow, wt WorkflowNotifyT
 	}
 }
 
-func NotifyWorkflow(workflowId string, wt WorkflowNotifyType) {
+func NotifyWorkflow(projectId, workflowId string, wt WorkflowNotifyType) {
 	s := model.GetStorage()
-	workflow, exist, err := s.GetWorkflowDetailById(workflowId)
+	workflow, err := dms.GetWorkflowDetailByWorkflowId(projectId, workflowId, s.GetWorkflowDetailWithoutInstancesByWorkflowID)
 	if err != nil {
-		log.NewEntry().Errorf("notify workflow error, %v", err)
-		return
-	}
-	if !exist {
 		log.NewEntry().Error("notify workflow error, workflow not exits")
 		return
-	}
-
-	instanceIds := make([]uint64, 0, len(workflow.Record.InstanceRecords))
-	for _, item := range workflow.Record.InstanceRecords {
-		instanceIds = append(instanceIds, item.InstanceId)
-	}
-
-	instances, err := dms.GetInstancesInProjectByIds(context.Background(), string(workflow.ProjectId), instanceIds)
-	if err != nil {
-		log.NewEntry().Errorf("get instance error, %v", err)
-		return
-	}
-	instanceMap := map[uint64]*model.Instance{}
-	for _, instance := range instances {
-		instanceMap[instance.ID] = instance
-	}
-	for i, item := range workflow.Record.InstanceRecords {
-		if instance, ok := instanceMap[item.InstanceId]; ok {
-			workflow.Record.InstanceRecords[i].Instance = instance
-		}
 	}
 
 	go func() { notifyWorkflowWebhook(workflow, wt) }()
@@ -389,6 +364,28 @@ func (t *TestNotify) NotificationBody() string {
 	return "This is a SQLE test notification\nIf you receive this message, it only means that the message can be pushed"
 }
 
+func getAPNotifyConfig() (AuditPlanNotifyConfig, error) {
+	s := model.GetStorage()
+	config := AuditPlanNotifyConfig{}
+
+	url, err := s.GetSqleUrl()
+	if err != nil {
+		return config, err
+	}
+
+	if len(url) > 0 {
+		config.SQLEUrl = &url
+
+		// dms-todo: 从 dms 获取 project 名称，但最终考虑将告警移走.
+		// project, _, err := s.GetProjectByID(ap.ProjectId)
+		// if err != nil {
+		// 	return err
+		// }
+		// config.ProjectName = &project.Name
+	}
+	return config, nil
+}
+
 func NotifyAuditPlan(auditPlanId uint, report *model.AuditPlanReportV2) error {
 	s := model.GetStorage()
 	ap, _, err := s.GetAuditPlanById(auditPlanId)
@@ -399,21 +396,9 @@ func NotifyAuditPlan(auditPlanId uint, report *model.AuditPlanReportV2) error {
 	// if err != nil {
 	// 	return err
 	// }
-	url, err := s.GetSqleUrl()
+	config, err := getAPNotifyConfig()
 	if err != nil {
 		return err
-	}
-
-	config := AuditPlanNotifyConfig{}
-	if len(url) > 0 {
-		config.SQLEUrl = &url
-
-		// dms-todo: 从 dms 获取 project 名称，但最终考虑将告警移走.
-		// project, _, err := s.GetProjectByID(ap.ProjectId)
-		// if err != nil {
-		// 	return err
-		// }
-		// config.ProjectName = &project.Name
 	}
 
 	if driverV2.RuleLevelLessOrEqual(ap.NotifyLevel, report.AuditLevel) {
@@ -501,4 +486,17 @@ func (n *AuditPlanNotifier) updateRecord(auditPlanName string) {
 	n.mutex.Lock()
 	n.lastSend[auditPlanName] = time.Now()
 	n.mutex.Unlock()
+}
+
+func NotifyAuditPlanWebhook(auditPlan *model.AuditPlan, report *model.AuditPlanReportV2) {
+	config, err := getAPNotifyConfig()
+	if err != nil {
+		log.NewEntry().Errorf("audit plan webhook failed: %v", err)
+		return
+	}
+
+	err = auditPlanSendRequest(auditPlan, report, config)
+	if err != nil {
+		log.NewEntry().Errorf("audit plan webhook failed: %v", err)
+	}
 }

@@ -4,13 +4,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 
 	"github.com/actiontech/sqle/sqle/driver/mysql/executor"
+	"github.com/actiontech/sqle/sqle/log"
 	"github.com/actiontech/sqle/sqle/utils"
 	"github.com/pingcap/parser/ast"
 	"github.com/pingcap/parser/format"
+	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/types"
 	driver "github.com/pingcap/tidb/types/parser_driver"
 	"github.com/sirupsen/logrus"
@@ -26,7 +29,7 @@ func GetAffectedRowNum(ctx context.Context, originSql string, conn *executor.Exe
 
 	var newNode ast.Node
 	var affectRowSql string
-	var hasGroupByOrGroupByAndHavingBoth bool
+	var cannotConvert bool
 
 	// 语法规则文档
 	// select: https://dev.mysql.com/doc/refman/8.0/en/select.html
@@ -36,9 +39,8 @@ func GetAffectedRowNum(ctx context.Context, originSql string, conn *executor.Exe
 	switch stmt := node.(type) {
 	case *ast.SelectStmt:
 		isGroupByAndHavingBothExist := stmt.GroupBy != nil && stmt.Having != nil
-		// 包含group by或者group by和having都存在的select语句
-		if stmt.GroupBy != nil || isGroupByAndHavingBothExist {
-			hasGroupByOrGroupByAndHavingBoth = true
+		if stmt.GroupBy != nil || isGroupByAndHavingBothExist || stmt.Limit != nil {
+			cannotConvert = true
 		}
 
 		newNode = getSelectNodeFromSelect(stmt)
@@ -62,11 +64,19 @@ func GetAffectedRowNum(ctx context.Context, originSql string, conn *executor.Exe
 		return 0, ErrUnsupportedSqlType
 	}
 
-	// 存在group by或者group by和having都存在的select语句，无法转换为select count语句
-	// 使用子查询 select count(*) from (输入的sql) as t的方式来获取影响行数
-	if hasGroupByOrGroupByAndHavingBoth {
+	// 1. 存在group by或者group by和having都存在的select语句，无法转换为select count语句
+	// 2. SELECT COUNT(1) FROM test LIMIT 10,10 类型的SQL结果集为空
+	// 已上两种情况,使用子查询 select count(*) from (输入的sql) as t的方式来获取影响行数
+	if cannotConvert {
+		// 将select语句中的查询字段替换为数字1
+		// https://github.com/actiontech/sqle/issues/2175
+		newSql, err := useIntReplaceSelectFields(node)
+		if err != nil {
+			log.NewEntry().Errorf("replace select fields failed, err: %v", err)
+			newSql = originSql
+		}
 		// 移除后缀分号，避免sql语法错误
-		trimSuffix := strings.TrimRight(originSql, ";")
+		trimSuffix := strings.TrimRight(newSql, ";")
 		affectRowSql = fmt.Sprintf("select count(*) from (%s) as t", trimSuffix)
 	} else {
 		sqlBuilder := new(strings.Builder)
@@ -82,7 +92,7 @@ func GetAffectedRowNum(ctx context.Context, originSql string, conn *executor.Exe
 	// 避免在客户机器上执行不符合预期的sql语句
 	err = checkSql(affectRowSql)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("check sql(%v) failed, origin sql(%v), err: %v", affectRowSql, originSql, err)
 	}
 
 	_, row, err := conn.Db.QueryWithContext(ctx, affectRowSql)
@@ -90,8 +100,15 @@ func GetAffectedRowNum(ctx context.Context, originSql string, conn *executor.Exe
 		return 0, err
 	}
 
-	if len(row) != 1 {
-		return 0, errors.New("affectRowSql error")
+	// 如果下发的 SELECT COUNT(1) 的SQL，返回的结果集为空, 则返回0
+	// 例: SELECT COUNT(1) FROM test LIMIT 10,10 结果集为空
+	if len(row) == 0 {
+		log.NewEntry().Errorf("affected row sql(%v) result row count is 0", affectRowSql)
+		return 0, nil
+	}
+
+	if len(row) < 1 {
+		return 0, fmt.Errorf("affected row sql(%v) result row count(%v) less than 1", affectRowSql, len(row))
 	}
 
 	affectCount, err := strconv.ParseInt(row[0][0].String, 10, 64)
@@ -100,6 +117,25 @@ func GetAffectedRowNum(ctx context.Context, originSql string, conn *executor.Exe
 	}
 
 	return affectCount, nil
+}
+
+func useIntReplaceSelectFields(node ast.StmtNode) (string, error) {
+	stmt, ok := node.(*ast.SelectStmt)
+	if !ok {
+		return "", errors.New("pass parameter is not select node")
+	}
+	newValue := &driver.ValueExpr{}
+	newValue.SetInt64(1)
+	selectFields := &ast.SelectField{Expr: newValue}
+	stmt.Fields.Fields = []*ast.SelectField{selectFields}
+
+	sqlBuilder := new(strings.Builder)
+	err := stmt.Restore(format.NewRestoreCtx(format.DefaultRestoreFlags, sqlBuilder))
+	if err != nil {
+		return "", err
+	}
+	affectRowSql := sqlBuilder.String()
+	return affectRowSql, nil
 }
 
 func getSelectNodeFromDelete(stmt *ast.DeleteStmt) *ast.SelectStmt {
@@ -230,4 +266,73 @@ func KillProcess(ctx context.Context, killSQL string, killConn *executor.Executo
 	}
 	logEntry.Infof("exec sql(%v) successfully", killSQL)
 	return nil
+}
+
+func IsGeometryColumn(col *ast.ColumnDef) bool {
+	switch col.Tp.Tp {
+	case mysql.TypeGeometry, mysql.TypePoint, mysql.TypeLineString, mysql.TypePolygon,
+		mysql.TypeMultiPoint, mysql.TypeMultiLineString, mysql.TypeMultiPolygon, mysql.TypeGeometryCollection:
+		return true
+	}
+	return false
+}
+
+// TODO: 暂时使用正则表达式匹配event，后续会修改语法树进行匹配event
+func IsEventSQL(sql string) bool {
+	createPattern := `^CREATE\s+(DEFINER\s?=.+?)?EVENT`
+	createRe := regexp.MustCompile(createPattern)
+	alterPattern := `^ALTER\s+(DEFINER\s?=.+?)?EVENT`
+	alterRe := regexp.MustCompile(alterPattern)
+
+	sql = strings.ToUpper(strings.TrimSpace(sql))
+	if createRe.MatchString(sql) {
+		return true
+	} else {
+		return alterRe.MatchString(sql)
+	}
+}
+
+func GetTableNameFromTableSource(tableSource *ast.TableSource) string {
+	if tableSource == nil {
+		return ""
+	}
+	if tableSource.AsName.L != "" {
+		return tableSource.AsName.L
+	}
+	if tableName, ok := tableSource.Source.(*ast.TableName); ok {
+		return tableName.Name.L
+	}
+	return ""
+}
+
+/*
+IsIndex
+
+	判断单列或多列是否属于索引切片中的索引：
+		1. 单列：满足单列索引或多列索引的第一列，则返回true
+		2. 多列：满足N列是M列索引的前N列（M>=N），则返回true
+		3. 否则返回false
+*/
+func IsIndex(columnMap map[string] /*column name*/ struct{}, constraints []*ast.Constraint) bool {
+	if len(columnMap) == 0 {
+		return false
+	}
+	for _, constraint := range constraints {
+		if len(columnMap) > len(constraint.Keys) {
+			// 若符合索引的列数小于关联列的列数 一定不满足多列索引
+			continue
+		}
+		var matchCount int
+		for _, key := range constraint.Keys {
+			if _, ok := columnMap[key.Column.Name.L]; ok {
+				matchCount++
+			} else {
+				break
+			}
+		}
+		if matchCount == len(columnMap) {
+			return true
+		}
+	}
+	return false
 }

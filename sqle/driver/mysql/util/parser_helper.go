@@ -2,6 +2,7 @@ package util
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -13,7 +14,7 @@ import (
 	_model "github.com/pingcap/parser/model"
 	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/parser/opcode"
-	"github.com/pingcap/tidb/types"
+	"github.com/pingcap/tidb/sessionctx/stmtctx"
 	driver "github.com/pingcap/tidb/types/parser_driver"
 )
 
@@ -269,17 +270,78 @@ func WhereStmtHasSubQuery(where ast.ExprNode) bool {
 	return hasSubQuery
 }
 
-func WhereStmtHasOneColumn(where ast.ExprNode) bool {
-	hasColumn := false
+// compare binary.L to binary.R
+func getBinaryExprCompareResult(binary *ast.BinaryOperationExpr) (bool, error) {
+	col1, ok := binary.L.(*driver.ValueExpr)
+	if !ok {
+		return false, errors.New("binary.L is not driver.ValueExpr")
+	}
+	col2, ok := binary.R.(*driver.ValueExpr)
+	if !ok {
+		return false, errors.New("binary.R is not driver.ValueExpr")
+	}
+	// 暂时只判断相同类型数据的比值，不考虑隐式转换
+	if col1.Datum.Kind() != col2.Datum.Kind() {
+		return false, nil
+	}
+	sc := &stmtctx.StatementContext{}
+
+	// col1 < col2; return -1
+	// col1 == col2; return 0
+	// col1 > col2; return 1
+	result, err := col1.CompareDatum(sc, &col2.Datum)
+	if err != nil {
+		return false, err
+	}
+	switch binary.Op {
+	case opcode.GE:
+		if result == 1 || result == 0 {
+			return true, nil
+		}
+	case opcode.GT:
+		if result == 1 {
+			return true, nil
+		}
+	case opcode.LE:
+		if result == 0 || result == -1 {
+			return true, nil
+		}
+	case opcode.LT:
+		if result == -1 {
+			return true, nil
+		}
+	case opcode.EQ:
+		if result == 0 {
+			return true, nil
+		}
+	case opcode.NE:
+		if result != 0 {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+func WhereStmtNotAlwaysTrue(where ast.ExprNode) bool {
+	notAlwaysTrue := false
 	ScanWhereStmt(func(expr ast.ExprNode) (skip bool) {
 		switch x := expr.(type) {
 		case *ast.FuncCallExpr:
-			hasColumn = true
+			notAlwaysTrue = true
 			return true
 		case *ast.ColumnNameExpr:
-			hasColumn = true
+			notAlwaysTrue = true
+			return true
+		case *ast.ExistsSubqueryExpr:
+			notAlwaysTrue = true
 			return true
 		case *ast.BinaryOperationExpr:
+			compareResult, err := getBinaryExprCompareResult(x)
+			if err == nil && !compareResult {
+				notAlwaysTrue = true
+				return true
+			}
 			col1, ok := x.R.(*ast.ColumnNameExpr)
 			if !ok {
 				return false
@@ -294,7 +356,7 @@ func WhereStmtHasOneColumn(where ast.ExprNode) bool {
 		}
 		return false
 	}, where)
-	return hasColumn
+	return notAlwaysTrue
 }
 
 func IsFuncUsedOnColumnInWhereStmt(cols map[string]struct{}, where ast.ExprNode) bool {
@@ -316,48 +378,51 @@ func IsFuncUsedOnColumnInWhereStmt(cols map[string]struct{}, where ast.ExprNode)
 	return usedFunc
 }
 
-func IsColumnImplicitConversionInWhereStmt(colTypeMap map[string]string, where ast.ExprNode) bool {
-	hasConversion := false
+func ScanColumnValueFromExpr(where ast.ExprNode, fn func(*ast.ColumnName, []*driver.ValueExpr) bool) {
 	ScanWhereStmt(func(expr ast.ExprNode) (skip bool) {
+		var values []*driver.ValueExpr
+		var columnNameExpr *ast.ColumnNameExpr
+
 		switch x := expr.(type) {
 		case *ast.BinaryOperationExpr:
-			var valueExpr *driver.ValueExpr
-			var columnNameExpr *ast.ColumnNameExpr
 			if colValue, checkValueExpr := x.L.(*driver.ValueExpr); checkValueExpr {
-				valueExpr = colValue
+				values = append(values, colValue)
 			} else if columnName, checkColumnNameExpr := x.L.(*ast.ColumnNameExpr); checkColumnNameExpr {
 				columnNameExpr = columnName
 			} else {
 				return false
 			}
 			if colValue, checkValueExpr := x.R.(*driver.ValueExpr); checkValueExpr {
-				valueExpr = colValue
+				values = append(values, colValue)
 			} else if columnName, checkColumnNameExpr := x.R.(*ast.ColumnNameExpr); checkColumnNameExpr {
 				columnNameExpr = columnName
 			} else {
 				return false
 			}
-			if valueExpr == nil || columnNameExpr == nil {
+			if len(values) == 0 || columnNameExpr == nil {
 				return false
 			}
-			if colType, ok := colTypeMap[columnNameExpr.Name.String()]; ok {
-				switch valueExpr.Datum.GetValue().(type) {
-				case string:
-					if colType != "string" {
-						hasConversion = true
-						return true
-					}
-				case int, int8, int16, int32, int64, *types.MyDecimal:
-					if colType != "int" {
-						hasConversion = true
-						return true
-					}
+
+			return fn(columnNameExpr.Name, values)
+		case *ast.PatternInExpr:
+			c, ok := x.Expr.(*ast.ColumnNameExpr)
+			if !ok {
+				return false
+			}
+			columnNameExpr = c
+			for _, expr := range x.List {
+				if v, ok := expr.(*driver.ValueExpr); ok {
+					values = append(values, v)
 				}
 			}
+			if len(values) == 0 || columnNameExpr == nil {
+				return false
+			}
+
+			return fn(columnNameExpr.Name, values)
 		}
 		return false
 	}, where)
-	return hasConversion
 }
 
 func WhereStmtExistNot(where ast.ExprNode) bool {
@@ -393,19 +458,47 @@ func WhereStmtExistNot(where ast.ExprNode) bool {
 	return existNOT
 }
 
-//Check is exist a full fuzzy query or a left fuzzy query. E.g: %name% or %name
+// Check is exist a left fuzzy query.
+func CheckWhereLeftFuzzySearch(where ast.ExprNode) bool {
+	isExist := false
+	ScanWhereStmt(func(expr ast.ExprNode) (skip bool) {
+		switch x := expr.(type) {
+		case *ast.PatternLikeExpr:
+			var resultString string
+			switch pattern := x.Pattern.(type) {
+			case *driver.ValueExpr:
+				resultString = pattern.Datum.GetString()
+			case *ast.FuncCallExpr:
+				resultString = NewFuncCallStringResultGenerator(pattern).GenerateResult()
+			}
+			if (strings.HasPrefix(resultString, "%") || strings.HasPrefix(resultString, "_")) && !(strings.HasSuffix(resultString, "%") || strings.HasSuffix(resultString, "_")) {
+				isExist = true
+				return true
+			}
+		}
+		return false
+	}, where)
+	return isExist
+}
+
+// Check is exist a full fuzzy query or a left fuzzy query. E.g: %name% or %name
 func CheckWhereFuzzySearch(where ast.ExprNode) bool {
 	isExist := false
 	ScanWhereStmt(func(expr ast.ExprNode) (skip bool) {
 		switch x := expr.(type) {
 		case *ast.PatternLikeExpr:
+			var resultString string
 			switch pattern := x.Pattern.(type) {
 			case *driver.ValueExpr:
-				datum := pattern.Datum.GetString()
-				if strings.HasPrefix(datum, "%") || strings.HasPrefix(datum, "_") {
-					isExist = true
-					return true
-				}
+				resultString = pattern.Datum.GetString()
+			case *ast.FuncCallExpr:
+				resultString = NewFuncCallStringResultGenerator(pattern).GenerateResult()
+				// unsupport subquery result as value of like
+				// example (select '%' 'any_string' '%')
+			}
+			if strings.HasPrefix(resultString, "%") || strings.HasPrefix(resultString, "_") {
+				isExist = true
+				return true
 			}
 		}
 		return false
@@ -804,4 +897,21 @@ func ExtractIndexFromCreateTableStmt(table *ast.CreateTableStmt) map[string] /*i
 		}
 	}
 	return result
+}
+
+// match table name if input is table name
+func ConvertAliasToTable(alias string, tables []*ast.TableSource) (*ast.TableName, error) {
+	for _, table := range tables {
+		t, ok := table.Source.(*ast.TableName)
+		if !ok || t == nil {
+			continue
+		}
+
+		if strings.ToLower(alias) == table.AsName.L || alias == t.Name.L {
+			return t, nil
+		}
+
+		return t, nil
+	}
+	return nil, errors.New("can not find table")
 }

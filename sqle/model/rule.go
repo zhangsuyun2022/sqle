@@ -30,6 +30,9 @@ func GenerateRuleByDriverRule(dr *driverV2.Rule, dbType string) *Rule {
 		Typ:        dr.Category,
 		DBType:     dbType,
 		Params:     dr.Params,
+		Knowledge: &RuleKnowledge{
+			Content: dr.Knowledge.Content,
+		},
 	}
 }
 
@@ -44,14 +47,32 @@ func ConvertRuleToDriverRule(r *Rule) *driverV2.Rule {
 	}
 }
 
+type RuleKnowledge struct {
+	Model
+	Content string `gorm:"type:longtext"`
+}
+
+func (r *RuleKnowledge) TableName() string {
+	return "rule_knowledge"
+}
+
+func (r *RuleKnowledge) GetContent() string {
+	if r == nil {
+		return ""
+	}
+	return r.Content
+}
+
 type Rule struct {
-	Name       string        `json:"name" gorm:"primary_key; not null"`
-	DBType     string        `json:"db_type" gorm:"primary_key; not null; default:\"mysql\""`
-	Desc       string        `json:"desc"`
-	Annotation string        `json:"annotation" gorm:"column:annotation"`
-	Level      string        `json:"level" example:"error"` // notice, warn, error
-	Typ        string        `json:"type" gorm:"column:type; not null"`
-	Params     params.Params `json:"params" gorm:"type:varchar(1000)"`
+	Name        string         `json:"name" gorm:"primary_key; not null"`
+	DBType      string         `json:"db_type" gorm:"primary_key; not null; default:\"mysql\""`
+	Desc        string         `json:"desc"`
+	Annotation  string         `json:"annotation" gorm:"column:annotation"`
+	Level       string         `json:"level" example:"error"` // notice, warn, error
+	Typ         string         `json:"type" gorm:"column:type; not null"`
+	Params      params.Params  `json:"params" gorm:"type:varchar(1000)"`
+	KnowledgeId uint           `json:"knowledge_id"`
+	Knowledge   *RuleKnowledge `json:"knowledge" gorm:"foreignkey:KnowledgeId"`
 }
 
 func (r Rule) TableName() string {
@@ -156,7 +177,7 @@ func (s *Storage) GetRuleTemplatesByInstanceNameAndProjectId(name string, projec
 }
 
 func (s *Storage) GetRulesFromRuleTemplateByName(projectIds []string, name string) ([]*Rule, []*CustomRule, error) {
-	tpl, exist, err := s.GetRuleTemplateDetailByNameAndProjectIds(projectIds, name)
+	tpl, exist, err := s.GetRuleTemplateDetailByNameAndProjectIds(projectIds, name, "")
 	if !exist {
 		return nil, nil, errors.New(errors.DataNotExist, err)
 	}
@@ -217,12 +238,18 @@ func (s *Storage) IsRuleTemplateExistFromAnyProject(projectId ProjectUID, name s
 	return count > 0, errors.ConnectStorageErrWrapper(err)
 }
 
-func (s *Storage) GetRuleTemplateDetailByNameAndProjectIds(projectIds []string, name string) (*RuleTemplate, bool, error) {
+func (s *Storage) GetRuleTemplateDetailByNameAndProjectIds(projectIds []string, name string, fuzzy_keyword_rule string) (*RuleTemplate, bool, error) {
 	dbOrder := func(db *gorm.DB) *gorm.DB {
 		return db.Order("rule_template_rule.rule_name ASC")
 	}
+	fuzzy_condition := func(db *gorm.DB) *gorm.DB {
+		if fuzzy_keyword_rule == "" {
+			return db
+		}
+		return db.Where("`desc` like ? OR annotation like ?", fmt.Sprintf("%%%s%%", fuzzy_keyword_rule), fmt.Sprintf("%%%s%%", fuzzy_keyword_rule))
+	}
 	t := &RuleTemplate{Name: name}
-	err := s.db.Preload("RuleList", dbOrder).Preload("RuleList.Rule").Preload("CustomRuleList.CustomRule").
+	err := s.db.Preload("RuleList", dbOrder).Preload("RuleList.Rule", fuzzy_condition).Preload("CustomRuleList.CustomRule", fuzzy_condition).
 		Where(t).
 		Where("project_id IN (?)", projectIds).
 		First(t).Error
@@ -257,6 +284,15 @@ func (s *Storage) CloneRuleTemplateRules(source, destination *RuleTemplate) erro
 	return s.UpdateRuleTemplateRules(destination, source.RuleList...)
 }
 
+func (s *Storage) GetRuleTemplateRuleByName(name string, dbType string) (*[]RuleTemplateRule, error) {
+	ruleTemplateRule := []RuleTemplateRule{}
+	err := s.db.Where("rule_name = ?", name).Where("db_type = ?", dbType).Find(&ruleTemplateRule).Error
+	if err == gorm.ErrRecordNotFound {
+		return nil, nil
+	}
+	return &ruleTemplateRule, errors.New(errors.ConnectStorageError, err)
+}
+
 func (s *Storage) CloneRuleTemplateCustomRules(source, destination *RuleTemplate) error {
 	return s.UpdateRuleTemplateCustomRules(destination, source.CustomRuleList...)
 }
@@ -269,6 +305,13 @@ func GetRuleMapFromAllArray(allRules ...[]Rule) map[string]Rule {
 		}
 	}
 	return ruleMap
+}
+
+func (s *Storage) GetRuleTemplateById(id uint64) (*RuleTemplate, error) {
+	ruleTemplate := new(RuleTemplate)
+
+	err := s.db.Where("id = ?", id).First(ruleTemplate).Error
+	return ruleTemplate, errors.New(errors.ConnectStorageError, err)
 }
 
 func (s *Storage) GetRuleTemplateTips(projectId, dbType string) ([]*RuleTemplate, error) {
@@ -291,25 +334,23 @@ func (s *Storage) GetRule(name, dbType string) (*Rule, bool, error) {
 	return &rule, true, errors.New(errors.ConnectStorageError, err)
 }
 
-func (s *Storage) GetAllRule() ([]*Rule, error) {
+func (s *Storage) GetAllRules() ([]*Rule, error) {
 	rules := []*Rule{}
-	err := s.db.Find(&rules).Error
+	err := s.db.Preload("Knowledge").Find(&rules).Error
 	return rules, errors.New(errors.ConnectStorageError, err)
+}
+
+func (s *Storage) DeleteCascadeRule(name, dbType string) error {
+	err := s.db.Exec(`delete u,t, k 
+					from rules u 
+					left join rule_template_rule t on u.name = t.rule_name and u.db_type = t.db_type 
+					left join rule_knowledge k on u.knowledge_id = k.id where u.name = ? AND u.db_type = ? `, name, dbType).Error
+	return err
 }
 
 func (s *Storage) GetAllRuleByDBType(dbType string) ([]*Rule, error) {
 	rules := []*Rule{}
 	err := s.db.Where(&Rule{DBType: dbType}).Find(&rules).Error
-	return rules, errors.New(errors.ConnectStorageError, err)
-}
-
-func (s *Storage) GetAllRuleByGlobalRuleTemplateName(name string) ([]*Rule, error) {
-	rules := []*Rule{}
-	err := s.db.Joins("LEFT JOIN rule_template_rule ON rules.name = rule_template_rule.rule_name").
-		Joins("LEFT JOIN rule_templates ON rule_template_rule.rule_template_id = rule_templates.id").
-		Where("rule_templates.project_id = 0").
-		Where("rule_templates.name = ?", name).
-		Find(&rules).Error
 	return rules, errors.New(errors.ConnectStorageError, err)
 }
 
@@ -418,14 +459,16 @@ func (s *Storage) GetRuleTypeByDBType(DBType string) ([]string, error) {
 
 type CustomRule struct {
 	Model
-	RuleId     string `json:"rule_id" gorm:"unique; not null"`
-	Desc       string `json:"desc" gorm:"not null"`
-	Annotation string `json:"annotation"`
-	DBType     string `json:"db_type" gorm:"not null; default:\"mysql\""`
-	Level      string `json:"level" example:"error"` // notice, warn, error
-	Typ        string `json:"type" gorm:"column:type; not null"`
-	RuleScript string `json:"rule_script" gorm:"type:text"`
-	ScriptType string `json:"script_type" gorm:"not null; default:\"regular\""`
+	RuleId      string         `json:"rule_id" gorm:"unique; not null"`
+	Desc        string         `json:"desc" gorm:"not null"`
+	Annotation  string         `json:"annotation"`
+	DBType      string         `json:"db_type" gorm:"not null; default:\"mysql\""`
+	Level       string         `json:"level" example:"error"` // notice, warn, error
+	Typ         string         `json:"type" gorm:"column:type; not null"`
+	RuleScript  string         `json:"rule_script" gorm:"type:text"`
+	ScriptType  string         `json:"script_type" gorm:"not null; default:\"regular\""`
+	KnowledgeId uint           `json:"knowledge_id"`
+	Knowledge   *RuleKnowledge `json:"knowledge" gorm:"foreignkey:KnowledgeId"`
 }
 
 func (s *Storage) GetCustomRuleByRuleId(ruleId string) (*CustomRule, bool, error) {
@@ -554,17 +597,6 @@ func (s *Storage) UpdateRuleTemplateCustomRules(tpl *RuleTemplate, rules ...Rule
 	})
 
 	return errors.New(errors.ConnectStorageError, err)
-}
-
-func (s *Storage) GetAllCustomRuleByGlobalRuleTemplateName(name string) ([]*CustomRule, error) {
-	rules := []*CustomRule{}
-	err := s.db.Joins("LEFT JOIN rule_template_custom_rules ON custom_rules.rule_id = rule_template_custom_rules.rule_id").
-		Joins("LEFT JOIN rule_templates ON rule_template_custom_rules.rule_template_id = rule_templates.id").
-		Where("rule_templates.project_id = 0").
-		Where("rule_templates.deleted_at is null").
-		Where("rule_templates.name = ?", name).
-		Find(&rules).Error
-	return rules, errors.New(errors.ConnectStorageError, err)
 }
 
 func (s *Storage) GetAllRulesByTmpNameAndProjectIdInstanceDBType(ruleTemplateName string, projectId string,

@@ -1,6 +1,7 @@
 package model
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -46,11 +47,34 @@ type AuditPlanSQLV2 struct {
 	// add unique index on fingerprint and audit_plan_id
 	// it's done by AutoMigrate() because gorm can't create index on TEXT column directly by tag.
 	AuditPlanID    uint   `json:"audit_plan_id" gorm:"not null"`
-	Fingerprint    string `json:"fingerprint" gorm:"type:text;not null"`
+	Fingerprint    string `json:"fingerprint" gorm:"type:mediumtext;not null"`
 	FingerprintMD5 string `json:"fingerprint_md5" gorm:"column:fingerprint_md5;not null"`
 	SQLContent     string `json:"sql" gorm:"type:mediumtext;not null"`
 	Info           JSON   `gorm:"type:json"`
 	Schema         string `json:"schema" gorm:"type:varchar(512);not null"`
+}
+
+const (
+	FilterTypeSQL  string = "SQL"
+	FilterTypeIP   string = "IP"
+	FilterTypeCIDR string = "CIDR"
+	FilterTypeHost string = "HOST"
+)
+
+type BlackListAuditPlanSQL struct {
+	Model
+	FilterContent string `json:"filter_content" gorm:"type:varchar(512);not null;"`
+	FilterType    string `json:"filter_type" gorm:"type:enum('SQL','IP','CIDR','HOST');default:'SQL';not null;"`
+}
+
+func (a BlackListAuditPlanSQL) TableName() string {
+	return "black_list_audit_plan_sqls"
+}
+
+func (s *Storage) GetBlackListAuditPlanSQLs() ([]*BlackListAuditPlanSQL, error) {
+	var blackListAPS []*BlackListAuditPlanSQL
+	err := s.db.Model(BlackListAuditPlanSQL{}).Find(&blackListAPS).Error
+	return blackListAPS, errors.New(errors.ConnectStorageError, err)
 }
 
 func (a AuditPlanSQLV2) TableName() string {
@@ -61,7 +85,17 @@ func (a *AuditPlanSQLV2) GetFingerprintMD5() string {
 	if a.FingerprintMD5 != "" {
 		return a.FingerprintMD5
 	}
-	return utils.Md5String(a.Fingerprint)
+	// 为了区分具有相同Fingerprint但Schema不同的SQL，在这里加入Schema信息进行区分
+	sqlIdentityJSON, _ := json.Marshal(
+		struct {
+			Fingerprint string
+			Schema      string
+		}{
+			Fingerprint: a.Fingerprint,
+			Schema:      a.Schema,
+		},
+	)
+	return utils.Md5String(string(sqlIdentityJSON))
 }
 
 // BeforeSave is a hook implement gorm model before exec create.
@@ -113,7 +147,7 @@ func (s *Storage) GetActiveAuditPlanById(id uint) (*AuditPlan, bool, error) {
 	return ap, true, errors.New(errors.ConnectStorageError, err)
 }
 
-func (s *Storage) GetAuditPlanFromProjectById(projectId, AuditPlanName string) (*AuditPlan, bool, error) {
+func (s *Storage) GetAuditPlanFromProjectByName(projectId, AuditPlanName string) (*AuditPlan, bool, error) {
 	ap := &AuditPlan{}
 	err := s.db.Model(AuditPlan{}).Where("project_id = ? AND name = ?", projectId, AuditPlanName).Find(ap).Error
 	if err == gorm.ErrRecordNotFound {
@@ -161,13 +195,85 @@ func (s *Storage) OverrideAuditPlanSQLs(auditPlanId uint, sqls []*AuditPlanSQLV2
 func (s *Storage) UpdateDefaultAuditPlanSQLs(auditPlanId uint, sqls []*AuditPlanSQLV2) error {
 	raw, args := getBatchInsertRawSQL(auditPlanId, sqls)
 	// counter column is a accumulate value when update.
-	raw += `
-ON DUPLICATE KEY UPDATE sql_content = VALUES(sql_content),
-                        info        = JSON_SET(COALESCE(info, '{}'),
-                                              '$.counter', CAST(COALESCE(JSON_EXTRACT(values(info), '$.counter'), 0) +
-                                                                COALESCE(JSON_EXTRACT(info, '$.counter'), 0) AS SIGNED),
-                                              '$.last_receive_timestamp',
-                                              JSON_EXTRACT(values(info), '$.last_receive_timestamp'));`
+	raw += `ON DUPLICATE KEY UPDATE 
+	sql_content = VALUES(sql_content), 
+	info        = JSON_SET(
+		COALESCE(info, '{}'),
+		'$.counter', CAST(
+			COALESCE(JSON_EXTRACT(values(info), '$.counter'), 0) 
+			+ COALESCE(JSON_EXTRACT(info, '$.counter'), 0) 
+			AS SIGNED
+		),
+		'$.last_receive_timestamp', JSON_EXTRACT(values(info), '$.last_receive_timestamp')
+		);`
+
+	return errors.New(errors.ConnectStorageError, s.db.Exec(raw, args...).Error)
+}
+
+func (s *Storage) UpdateSlowLogAuditPlanSQLs(auditPlanId uint, sqls []*AuditPlanSQLV2) error {
+	raw, args := getBatchInsertRawSQL(auditPlanId, sqls)
+	/*
+		counter 每次累加传入的count，新的count=记录中的count+传入的count
+		last_receive_timestamp 记录最后收到的时间戳，直接更新
+		query_time_avg 计算增加后的平均时间，的计算公式为：
+		(记录中的count*记录的平均时间+传入的count*传入的平均时间)/(记录中的count+传入的count)
+		格式为12位浮点型小数点后保存6位，其中如果记录中没有平均时间，则直接设置为传入的平均时间，
+		因为同一个sql的执行时间会随着sql的执行次数的增加而趋于收敛，所以这里我们直接设置为传入的平均时间。
+		如果传入没有平均时间，则是因为老版本Scannerd没有传入该值，因此把平均时间则设定为0，
+		为了保证计算中分母不为0，所以当找不到counter的时候，设置传入的counter为1
+		query_time_max 比较并更新传入和记录中该字段的较大值
+		first_query_at 记录该指纹的第一个日志记录的时间，为了兼容没有该功能的Scannerd，如果记录中无该值或该值为null，则更新为传入值，传入值为空时，更新为null，传入值不为空时更新为对应值
+		db_user 目前暂时保存为第一次执行该SQL的数据库用户，更新逻辑与first_query_at一致
+	*/
+	raw += `ON DUPLICATE KEY UPDATE 
+		sql_content = VALUES(sql_content), 
+		info = JSON_SET(
+			COALESCE(info, '{}'),
+			'$.counter', CAST(
+				COALESCE(JSON_EXTRACT(values(info), '$.counter'), 0) 
+				+ COALESCE(JSON_EXTRACT(info, '$.counter'), 0) 
+				AS SIGNED
+			),
+			'$.last_receive_timestamp', JSON_EXTRACT(values(info), '$.last_receive_timestamp'),
+			'$.query_time_max', GREATEST(
+				CAST(COALESCE(JSON_EXTRACT(info, '$.query_time_max'), 0) AS DECIMAL(12,6)),
+				CAST(COALESCE(JSON_EXTRACT(values(info), '$.query_time_max'), 0) AS DECIMAL(12,6))
+			),
+			'$.query_time_avg', CAST(
+			(
+				COALESCE(JSON_EXTRACT(info, '$.query_time_avg'), JSON_EXTRACT(values(info), '$.query_time_avg'))*COALESCE(JSON_EXTRACT(info, '$.counter'), 0)
+				+COALESCE(JSON_EXTRACT(values(info), '$.query_time_avg'), 0)*COALESCE(JSON_EXTRACT(values(info), '$.counter'), 0)
+			)/(
+				COALESCE(JSON_EXTRACT(info, '$.counter'), 0)
+				+COALESCE(JSON_EXTRACT(values(info), '$.counter'), 1)
+			)
+				AS DECIMAL(12,6)
+			),
+			'$.row_examined_avg', CAST(
+			(
+				COALESCE(JSON_EXTRACT(info, '$.row_examined_avg'), JSON_EXTRACT(values(info), '$.row_examined_avg'))*COALESCE(JSON_EXTRACT(info, '$.counter'), 0)
+				+COALESCE(JSON_EXTRACT(values(info), '$.row_examined_avg'), 0)*COALESCE(JSON_EXTRACT(values(info), '$.counter'), 0)
+			)/(
+				COALESCE(JSON_EXTRACT(info, '$.counter'), 0)
+				+COALESCE(JSON_EXTRACT(values(info), '$.counter'), 1)
+			)
+				AS DECIMAL(65,6)
+			),
+			'$.first_query_at', IF(
+				JSON_TYPE(JSON_EXTRACT(info, '$.first_query_at'))="NULL",
+				JSON_EXTRACT(values(info), '$.first_query_at'),
+				JSON_EXTRACT(info, '$.first_query_at')
+			),
+			'$.db_user', IF(
+				JSON_TYPE(JSON_EXTRACT(info, '$.db_user'))="NULL",
+				JSON_EXTRACT(values(info), '$.db_user'),
+				JSON_EXTRACT(info, '$.db_user')
+			),
+            '$.endpoints', JSON_MERGE(
+                JSON_EXTRACT(info, '$.endpoints'),
+			    JSON_EXTRACT(VALUES(info), '$.endpoints')
+            )
+	  	);`
 
 	return errors.New(errors.ConnectStorageError, s.db.Exec(raw, args...).Error)
 }
@@ -189,6 +295,19 @@ ON DUPLICATE KEY UPDATE sql_content = VALUES(sql_content),
 												/ (JSON_EXTRACT(info, '$.counter') + JSON_EXTRACT(VALUES(info), '$.counter'))
 												AS UNSIGNED
 											  ),
+											  '$.row_examined_avg', CAST(
+                                                       (
+                                                           COALESCE(JSON_EXTRACT(info, '$.row_examined_avg'),
+                                                                    JSON_EXTRACT(VALUES(info), '$.row_examined_avg')) *
+                                                           COALESCE(JSON_EXTRACT(info, '$.counter'), 0)
+                                                               +
+                                                           COALESCE(JSON_EXTRACT(VALUES(info), '$.row_examined_avg'), 0) *
+                                                           COALESCE(JSON_EXTRACT(VALUES(info), '$.counter'), 0)
+                                                           ) / (
+                                                           COALESCE(JSON_EXTRACT(info, '$.counter'), 0)
+                                                               + COALESCE(JSON_EXTRACT(VALUES(info), '$.counter'), 1)
+                                                           )
+                                                   AS DECIMAL(65,6)),
 											  '$.start_time',
 											  JSON_EXTRACT(values(info), '$.start_time'));`
 

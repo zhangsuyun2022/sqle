@@ -72,6 +72,11 @@ message Rule {
   string category = 4;
   repeated Param params = 5;
   string annotation = 6;
+  Knowledge knowledge = 7;
+}
+
+message Knowledge {
+  string content = 1;
 }
 
 // Metas
@@ -118,6 +123,7 @@ message Node {
   string text = 1;
   string type = 2;
   string fingerprint = 3;
+  uint64 startLine = 4;
 }
 
 message ParseResponse {

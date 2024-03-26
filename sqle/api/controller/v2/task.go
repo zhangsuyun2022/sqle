@@ -26,21 +26,25 @@ type GetAuditTaskSQLsResV2 struct {
 }
 
 type AuditTaskSQLResV2 struct {
-	Number      uint           `json:"number"`
-	ExecSQL     string         `json:"exec_sql"`
-	AuditResult []*AuditResult `json:"audit_result"`
-	AuditLevel  string         `json:"audit_level"`
-	AuditStatus string         `json:"audit_status"`
-	ExecResult  string         `json:"exec_result"`
-	ExecStatus  string         `json:"exec_status"`
-	RollbackSQL string         `json:"rollback_sql,omitempty"`
-	Description string         `json:"description"`
+	Number        uint           `json:"number"`
+	ExecSQL       string         `json:"exec_sql"`
+	SQLSourceFile string         `json:"sql_source_file"`
+	SQLStartLine  uint64         `json:"sql_start_line"`
+	AuditResult   []*AuditResult `json:"audit_result"`
+	AuditLevel    string         `json:"audit_level"`
+	AuditStatus   string         `json:"audit_status"`
+	ExecResult    string         `json:"exec_result"`
+	ExecStatus    string         `json:"exec_status"`
+	RollbackSQL   string         `json:"rollback_sql,omitempty"`
+	Description   string         `json:"description"`
+	SQLType       string         `json:"sql_type"`
 }
 
 type AuditResult struct {
 	Level    string `json:"level" example:"warn"`
 	Message  string `json:"message" example:"避免使用不必要的内置函数md5()"`
 	RuleName string `json:"rule_name"`
+	DbType   string `json:"db_type"`
 }
 
 // @Summary 获取指定扫描任务的SQLs信息
@@ -96,14 +100,17 @@ func GetTaskSQLs(c echo.Context) error {
 	taskSQLsRes := make([]*AuditTaskSQLResV2, 0, len(taskSQLs))
 	for _, taskSQL := range taskSQLs {
 		taskSQLRes := &AuditTaskSQLResV2{
-			Number:      taskSQL.Number,
-			Description: taskSQL.Description,
-			ExecSQL:     taskSQL.ExecSQL,
-			AuditLevel:  taskSQL.AuditLevel,
-			AuditStatus: taskSQL.AuditStatus,
-			ExecResult:  taskSQL.ExecResult,
-			ExecStatus:  taskSQL.ExecStatus,
-			RollbackSQL: taskSQL.RollbackSQL.String,
+			Number:        taskSQL.Number,
+			Description:   taskSQL.Description,
+			ExecSQL:       taskSQL.ExecSQL,
+			SQLSourceFile: taskSQL.SQLSourceFile.String,
+			SQLStartLine:  taskSQL.SQLStartLine,
+			AuditLevel:    taskSQL.AuditLevel,
+			AuditStatus:   taskSQL.AuditStatus,
+			ExecResult:    taskSQL.ExecResult,
+			ExecStatus:    taskSQL.ExecStatus,
+			RollbackSQL:   taskSQL.RollbackSQL.String,
+			SQLType:       taskSQL.SQLType.String,
 		}
 		for i := range taskSQL.AuditResults {
 			ar := taskSQL.AuditResults[i]
@@ -111,6 +118,7 @@ func GetTaskSQLs(c echo.Context) error {
 				Level:    ar.Level,
 				Message:  ar.Message,
 				RuleName: ar.RuleName,
+				DbType:   task.DBType,
 			})
 		}
 
