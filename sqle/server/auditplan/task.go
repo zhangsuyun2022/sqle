@@ -1645,6 +1645,10 @@ func queryTopSQLsForPg(inst *model.Instance, database string, orderBy string, to
 		if len(values) < 6 {
 			continue
 		}
+		// 过滤包含"<insufficient privilege>"sql语句
+		if strings.Contains(strings.ToLower(values[0].Value), "<insufficient privilege>") {
+			continue
+		}
 		executions, err := strconv.ParseFloat(values[1].Value, 64)
 		if err != nil {
 			return nil, err
