@@ -24,7 +24,7 @@ const (
 	where
 		pss.calls > 0 
 		and query <> '<insufficient privilege>'
-		and pd.datname = %v 
+		and pd.datname = '%v' 
 	group by pss.query 
 	order by %v desc limit %v
 	`
