@@ -1584,6 +1584,12 @@ func (at *PostgreSQLTopSQLTask) collectorDo() {
 	// 超时2分钟
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute*2)
 	defer cancel()
+
+	// 设置默认数据库为：postgres
+	if len(at.ap.InstanceDatabase) == 0 {
+		at.ap.InstanceDatabase = "postgres"
+	}
+
 	inst, _, err := dms.GetInstanceInProjectByName(ctx, string(at.ap.ProjectId), at.ap.InstanceName)
 	if err != nil {
 		at.logger.Errorf("query instance fail by projectId=%s and instanceName=%s, error: %v",
@@ -1624,10 +1630,6 @@ func (at *PostgreSQLTopSQLTask) collectorDo() {
 }
 
 func queryTopSQLsForPg(inst *model.Instance, database string, orderBy string, topN int) ([]*postgresql.DynPerformancePgColumns, error) {
-	// 设置默认数据库为：postgres
-	if len(database) == 0 {
-		database = "postgres"
-	}
 	// 获取pg插件
 	plugin, err := common.NewDriverManagerWithoutAudit(log.NewEntry(), inst, database)
 	if err != nil {
@@ -1635,17 +1637,21 @@ func queryTopSQLsForPg(inst *model.Instance, database string, orderBy string, to
 	}
 	defer plugin.Close(context.TODO())
 
-	// 会话超时时间：2分钟
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute*2)
+	// 会话超时时间：5秒
+	ctxForCreatePgExtension, cancel := context.WithTimeout(context.Background(), time.Second*5)
 	defer cancel()
 
 	// 执行创建pg_stat_statements扩展
-	_, err = plugin.Exec(ctx, `CREATE EXTENSION IF NOT EXISTS pg_stat_statements`)
+	_, err = plugin.Exec(ctxForCreatePgExtension, `CREATE EXTENSION IF NOT EXISTS pg_stat_statements`)
 	if err != nil {
 		return nil, err
 	}
 
-	sql := fmt.Sprintf(postgresql.DynPerformanceViewPgTpl, database, orderBy, topN)
+	// 会话超时时间：2分钟
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute*2)
+	defer cancel()
+
+	sql := fmt.Sprintf(postgresql.DynPerformanceViewPgTpl, inst, orderBy, topN)
 	result, err := plugin.Query(ctx, sql, &driverV2.QueryConf{TimeOutSecond: 120})
 	if err != nil {
 		return nil, err
