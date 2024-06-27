@@ -1624,16 +1624,28 @@ func (at *PostgreSQLTopSQLTask) collectorDo() {
 }
 
 func queryTopSQLsForPg(inst *model.Instance, database string, orderBy string, topN int) ([]*postgresql.DynPerformancePgColumns, error) {
+	// 设置默认数据库为：postgres
+	if len(database) == 0 {
+		database = "postgres"
+	}
+	// 获取pg插件
 	plugin, err := common.NewDriverManagerWithoutAudit(log.NewEntry(), inst, database)
 	if err != nil {
 		return nil, err
 	}
 	defer plugin.Close(context.TODO())
 
+	// 会话超时时间：2分钟
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute*2)
 	defer cancel()
 
-	sql := fmt.Sprintf(postgresql.DynPerformanceViewPgTpl, orderBy, topN)
+	// 执行创建pg_stat_statements扩展
+	_, err = plugin.Exec(ctx, `CREATE EXTENSION IF NOT EXISTS pg_stat_statements`)
+	if err != nil {
+		return nil, err
+	}
+
+	sql := fmt.Sprintf(postgresql.DynPerformanceViewPgTpl, database, orderBy, topN)
 	result, err := plugin.Query(ctx, sql, &driverV2.QueryConf{TimeOutSecond: 120})
 	if err != nil {
 		return nil, err
@@ -1643,10 +1655,6 @@ func queryTopSQLsForPg(inst *model.Instance, database string, orderBy string, to
 	for _, row := range rows {
 		values := row.Values
 		if len(values) < 6 {
-			continue
-		}
-		// 过滤包含"<insufficient privilege>"sql语句
-		if strings.Contains(strings.ToLower(values[0].Value), "<insufficient privilege>") {
 			continue
 		}
 		executions, err := strconv.ParseFloat(values[1].Value, 64)

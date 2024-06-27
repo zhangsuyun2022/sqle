@@ -11,16 +11,23 @@ type DynPerformancePgColumns struct {
 
 const (
 	DynPerformanceViewPgTpl = `
-SELECT query as sql_fulltext,
-sum(calls) as executions,
-sum(total_exec_time) AS elapsed_time,
-sum(shared_blks_read) AS disk_reads, -- 表示从共享缓冲区中读取的块数。这个值表示数据库系统从磁盘或其他存储介质中读取的数据块数量，而不是从内存中读取的数据。
-sum(shared_blks_hit) AS buffer_gets, -- 表示从共享缓冲区中命中的块数。这个值表示数据库系统从内存中读取的数据块数量，而不是从磁盘或其他存储介质中读取的数据。
-sum(blk_read_time) as user_io_wait_time
-FROM pg_stat_statements
-WHERE calls > 0
-group by query
-ORDER BY %v DESC limit %v`
+	select
+		pss.query as sql_fulltext,
+		sum ( pss.calls ) as executions,
+		sum ( pss.total_exec_time ) as elapsed_time,
+		sum ( pss.shared_blks_read ) as disk_reads,
+		sum ( pss.shared_blks_hit ) as buffer_gets,
+		sum ( pss.blk_read_time ) as user_io_wait_time 
+	from
+		pg_stat_statements pss
+		join pg_database pd on pss.dbid = pd.oid 
+	where
+		pss.calls > 0 
+		and query <> '<insufficient privilege>'
+		and pd.datname = %v 
+	group by pss.query 
+	order by %v desc limit %v
+	`
 	DynPerformanceViewPgSQLColumnExecutions     = "executions"
 	DynPerformanceViewPgSQLColumnElapsedTime    = "elapsed_time"
 	DynPerformanceViewPgSQLColumnDiskReads      = "disk_reads"
