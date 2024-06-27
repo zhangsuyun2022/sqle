@@ -1651,7 +1651,7 @@ func queryTopSQLsForPg(inst *model.Instance, database string, orderBy string, to
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute*2)
 	defer cancel()
 
-	sql := fmt.Sprintf(postgresql.DynPerformanceViewPgTpl, inst, orderBy, topN)
+	sql := fmt.Sprintf(postgresql.DynPerformanceViewPgTpl, database, orderBy, topN)
 	result, err := plugin.Query(ctx, sql, &driverV2.QueryConf{TimeOutSecond: 120})
 	if err != nil {
 		return nil, err
